@@ -7,6 +7,7 @@ import { extractYoutubeVideoId } from "./sanitizer";
 import {
   fetchLivePipedStreams,
   probeMediaStreamUrl,
+  resolveViaSaveNow,
   resolveViaVidsSave,
   resolveYoutubeStreamRace,
   type LivePipedData,
@@ -943,6 +944,13 @@ export async function resolveDirectStreamUrls(
       const p = await probeMediaStreamUrl(candidate).catch(() => null);
       if (p) return { videoUrl: p.url, isHls: p.isHls, provider: "jsonld" };
     }
+  }
+
+  try {
+    const sn = await resolveViaSaveNow(url, wantAudioOnly, targetHeight);
+    return { videoUrl: sn.videoUrl, audioUrl: sn.audioUrl, headers: sn.headers, isHls: sn.isHls, provider: sn.provider };
+  } catch {
+    /* try VidsSave */
   }
 
   try {
