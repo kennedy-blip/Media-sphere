@@ -1,6 +1,14 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { validateUrl } from "@/lib/sanitizer";
-import { createServerlessJob, validateJobOptions } from "@/lib/serverlessEngine";
+import {
+  createServerlessJob,
+  runRealServerlessJob,
+  validateJobOptions,
+} from "@/lib/serverlessEngine";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function POST(req: Request) {
   try {
@@ -18,8 +26,8 @@ export async function POST(req: Request) {
     if (!opts.ok) {
       return NextResponse.json({ detail: opts.error }, { status: 422 });
     }
-    const jobs = [];
-    const errors = [];
+    const jobs: ReturnType<typeof createServerlessJob>[] = [];
+    const errors: Array<{ url: string; error: string }> = [];
     for (const raw of rawUrls) {
       const v = validateUrl(raw);
       if (!v.valid || !v.sanitizedUrl || !v.platform) {
@@ -40,6 +48,13 @@ export async function POST(req: Request) {
         })
       );
     }
+
+    if (jobs.length > 0) {
+      after(async () => {
+        await Promise.all(jobs.map((j) => runRealServerlessJob(j.id)));
+      });
+    }
+
     return NextResponse.json({ jobs, errors, created: jobs.length }, { status: 201 });
   } catch {
     return NextResponse.json({ detail: "Invalid JSON body" }, { status: 400 });

@@ -1,10 +1,15 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { validateUrl } from "@/lib/sanitizer";
 import {
   createServerlessJob,
   listServerlessJobs,
+  runRealServerlessJob,
   validateJobOptions,
 } from "@/lib/serverlessEngine";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function GET() {
   return NextResponse.json({ jobs: listServerlessJobs() });
@@ -33,6 +38,11 @@ export async function POST(req: Request) {
       generate_subtitles: Boolean(body?.generate_subtitles),
       generate_summary: Boolean(body?.generate_summary),
     });
+
+    after(async () => {
+      await runRealServerlessJob(job.id);
+    });
+
     return NextResponse.json(job, { status: 201 });
   } catch {
     return NextResponse.json({ detail: "Invalid JSON body" }, { status: 400 });

@@ -11,6 +11,7 @@ interface MediaStore {
   jobs: Job[];
   setJobs: (jobs: Job[]) => void;
   upsertJob: (job: Job) => void;
+  removeJob: (id: string) => void;
   previews: Preview[];
   setPreviews: (p: Preview[]) => void;
   history: HistoryRecord[];
@@ -35,6 +36,10 @@ export const useStore = create<MediaStore>((set, get) => ({
       next[idx] = job;
       return { jobs: next };
     }),
+  removeJob: (id) =>
+    set((s) => ({
+      jobs: s.jobs.filter((j) => j.id !== id),
+    })),
   previews: [],
   setPreviews: (previews) => set({ previews }),
   history: [],

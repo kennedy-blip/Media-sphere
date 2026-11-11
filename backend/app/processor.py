@@ -1,6 +1,6 @@
 """
 Module C: Server-Side Media Processing Pipeline (FFmpeg)
-Trimming (stream-copy w/ transcode fallback), format conversion, 15-min TTL cleanup.
+Uses system ffmpeg or bundled imageio-ffmpeg static binary for real trimming & conversion.
 """
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ import struct
 import subprocess
 import time
 import wave
+
+try:
+    import imageio_ffmpeg  # type: ignore
+    _IMAGEIO_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    _IMAGEIO_FFMPEG = None
 
 STORAGE_DIR = os.environ.get("MEDIA_STORAGE_DIR", "/tmp/mediasphere_storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -23,8 +29,17 @@ MIME_TYPES = {
 }
 
 
+def get_ffmpeg_bin() -> str | None:
+    sys_bin = shutil.which("ffmpeg")
+    if sys_bin:
+        return sys_bin
+    if _IMAGEIO_FFMPEG and os.path.exists(_IMAGEIO_FFMPEG):
+        return _IMAGEIO_FFMPEG
+    return None
+
+
 def has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return get_ffmpeg_bin() is not None
 
 
 def media_type_for(fmt: str) -> str:
@@ -32,7 +47,6 @@ def media_type_for(fmt: str) -> str:
 
 
 def parse_timestamp(ts: str) -> float:
-    """Parse HH:MM:SS or MM:SS to seconds."""
     parts = ts.strip().split(":")
     try:
         if len(parts) == 3:
@@ -51,24 +65,24 @@ def trim_media(input_path: str, output_path: str, start: str | None, end: str | 
     """
     Trim with ffmpeg -ss -to. Stream-copy when keyframes align (fast),
     fallback to frame-accurate transcode.
-    Returns True on success.
     """
-    if not has_ffmpeg():
+    ffmpeg = get_ffmpeg_bin()
+    if not ffmpeg:
         return False
-    cmd = ["ffmpeg", "-y"]
+    cmd = [ffmpeg, "-y"]
     if start:
         cmd += ["-ss", start]
-    cmd += ["-i", input_path]
     if end:
         cmd += ["-to", end]
+    cmd += ["-i", input_path]
     if use_stream_copy:
         cmd += ["-c", "copy"]
     else:
-        cmd += ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-movflags", "+faststart"]
     cmd += [output_path]
     try:
         subprocess.run(cmd, capture_output=True, timeout=600, check=True)
-        return True
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 256
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         if use_stream_copy:
             return trim_media(input_path, output_path, start, end, use_stream_copy=False)
@@ -77,27 +91,40 @@ def trim_media(input_path: str, output_path: str, start: str | None, end: str | 
 
 def convert_media(input_path: str, output_path: str, fmt: str) -> bool:
     """Convert to mp4/webm/mp3/wav via ffmpeg."""
-    if not has_ffmpeg():
+    ffmpeg = get_ffmpeg_bin()
+    if not ffmpeg:
         return False
-    cmd = ["ffmpeg", "-y", "-i", input_path]
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        return True
+    cmd = [ffmpeg, "-y", "-i", input_path]
     if fmt == "mp3":
         cmd += ["-vn", "-codec:a", "libmp3lame", "-q:a", "2"]
     elif fmt == "wav":
         cmd += ["-vn", "-codec:a", "pcm_s16le"]
     elif fmt == "webm":
         cmd += ["-c:v", "libvpx-vp9", "-b:v", "1M", "-c:a", "libopus"]
-    else:  # mp4
-        cmd += ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"]
+    else:
+        if input_path.lower().endswith(".mp4"):
+            cmd += ["-c", "copy", "-movflags", "+faststart"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-movflags", "+faststart"]
     cmd += [output_path]
     try:
         subprocess.run(cmd, capture_output=True, timeout=600, check=True)
-        return True
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 256
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        if fmt == "mp4" and input_path.lower().endswith(".mp4"):
+            # Fallback transcode if stream copy failed
+            cmd2 = [ffmpeg, "-y", "-i", input_path, "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-movflags", "+faststart", output_path]
+            try:
+                subprocess.run(cmd2, capture_output=True, timeout=600, check=True)
+                return os.path.exists(output_path) and os.path.getsize(output_path) > 256
+            except Exception:
+                return False
         return False
 
 
 def _write_playable_wav(path: str, duration_sec: float = 2.0) -> None:
-    """Generate a valid, browser-playable 16-bit PCM WAV audio preview."""
     sample_rate = 22050
     total_samples = int(sample_rate * duration_sec)
     frames = bytearray()
@@ -115,51 +142,35 @@ def _write_playable_wav(path: str, duration_sec: float = 2.0) -> None:
 
 
 def create_placeholder_file(job_id: str, title: str, fmt: str, duration: int = 300) -> str:
-    """
-    When ffmpeg/live download is unavailable, generate a valid downloadable asset
-    so the full job lifecycle (progress, download, preview) works end-to-end.
-    """
+    """Used strictly when MEDIASPHERE_TEST_MOCK=true in offline test suites."""
     os.makedirs(STORAGE_DIR, exist_ok=True)
     ext = fmt if fmt in ("mp4", "webm", "mp3", "wav") else "mp4"
     path = os.path.join(STORAGE_DIR, f"{job_id}.{ext}")
-
-    # If ffmpeg is installed, synthesize a genuine playable test clip!
-    if has_ffmpeg():
-        clip_len = min(5, max(2, duration))
-        if ext in ("mp3", "wav"):
-            cmd = [
-                "ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={clip_len}",
-                path,
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"color=c=0x12131c:s=640x360:d={clip_len}",
-                "-f", "lavfi", "-i", f"sine=frequency=440:duration={clip_len}",
-                "-shortest", path,
-            ]
+    if ext in ("wav", "mp3"):
+        _write_playable_wav(path, duration_sec=2.0)
+        return path
+    ffmpeg = get_ffmpeg_bin()
+    if ffmpeg:
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "lavfi", "-i", "color=c=0x12131c:s=640x360:d=2",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+            "-shortest", path,
+        ]
         try:
-            subprocess.run(cmd, capture_output=True, timeout=30, check=True)
+            subprocess.run(cmd, capture_output=True, timeout=20, check=True)
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 return path
         except Exception:
             pass
-
-    if ext in ("wav", "mp3"):
-        _write_playable_wav(path, duration_sec=2.0)
-        return path
-
     with open(path, "wb") as f:
         f.write(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
-        f.write(
-            f"MediaSphere asset\nTitle: {title}\nJob: {job_id}\nFormat: {ext}\nDuration: {duration}s\n".encode()
-        )
+        f.write(f"MediaSphere test asset: {title}\n".encode())
         f.write(b"\x00" * 50_000)
     return path
 
 
 def cleanup_old_files(ttl_seconds: int = 900):
-    """15-min TTL auto-cleanup (run via CRON or post-job hook)."""
     if not os.path.isdir(STORAGE_DIR):
         return
     now = time.time()

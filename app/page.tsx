@@ -28,7 +28,7 @@ export default function Home() {
     return disconnect;
   }, [loadHistory, setJobs]);
 
-  const activeCount = jobs.filter((j) => !["ready", "failed", "cancelled"].includes(j.status)).length;
+  const activeCount = jobs.filter((j) => !["ready", "cancelled"].includes(j.status)).length;
   const doneCount = jobs.filter((j) => j.status === "ready").length;
 
   return (

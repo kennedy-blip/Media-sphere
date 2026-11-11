@@ -1,12 +1,20 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  serverExternalPackages: [
+    "@ffmpeg-installer/ffmpeg",
+    "@ffmpeg-installer/linux-x64",
+    "@distube/ytdl-core",
+    "youtubei.js",
+  ],
+  outputFileTracingIncludes: {
+    "/api/v1/jobs": ["./node_modules/@ffmpeg-installer/**/*"],
+    "/api/v1/batch": ["./node_modules/@ffmpeg-installer/**/*"],
+    "/api/v1/jobs/[id]": ["./node_modules/@ffmpeg-installer/**/*"],
+    "/api/v1/jobs/[id]/download": ["./node_modules/@ffmpeg-installer/**/*"],
+  },
   images: {
     remotePatterns: [
-      { protocol: "https", hostname: "picsum.photos" },
-      { protocol: "https", hostname: "i.pravatar.cc" },
-      { protocol: "https", hostname: "i.ytimg.com" },
-      { protocol: "https", hostname: "pbs.twimg.com" },
-      { protocol: "https", hostname: "scontent.cdninstagram.com" },
+      { protocol: "https", hostname: "**" },
     ],
   },
   async rewrites() {

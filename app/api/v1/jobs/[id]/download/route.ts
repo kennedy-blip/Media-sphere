@@ -1,45 +1,76 @@
+import fs from "fs";
+import { Readable } from "stream";
 import { NextResponse } from "next/server";
-import { buildPlayableWavBytes, getServerlessJob } from "@/lib/serverlessEngine";
+import { ensureDownloadableFile } from "@/lib/serverlessEngine";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
+const MIME_MAP: Record<string, string> = {
+  mp4: "video/mp4",
+  webm: "video/webm",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+};
 
 export async function GET(
   req: Request,
   context: { params: Promise<{ id: string }> }
 ) {
   const { id } = await context.params;
-  const job = getServerlessJob(id);
-  if (!job) {
-    return NextResponse.json({ detail: "Job not found" }, { status: 404 });
-  }
-  if (job.status !== "ready") {
-    return NextResponse.json(
-      { detail: `Job is not ready (status: ${job.status})` },
-      { status: 409 }
-    );
-  }
-  const url = new URL(req.url);
-  const asDownload = url.searchParams.get("download") === "true";
-  const ext = job.format || "mp4";
-  const safeTitle = job.title.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 40) || id;
-  const disposition = `${asDownload ? "attachment" : "inline"}; filename="${safeTitle}.${ext}"`;
+  try {
+    const resolved = await ensureDownloadableFile(id);
+    if (!resolved || !fs.existsSync(resolved.filePath)) {
+      return NextResponse.json({ detail: "Job not found" }, { status: 404 });
+    }
 
-  if (ext === "mp3" || ext === "wav") {
-    const wav = buildPlayableWavBytes(2);
-    return new NextResponse(new Uint8Array(wav), {
+    const stat = fs.statSync(resolved.filePath);
+    const total = stat.size;
+    const url = new URL(req.url);
+    const asDownload = url.searchParams.get("download") === "true";
+    const mime = MIME_MAP[resolved.format] || "application/octet-stream";
+    const disposition = `${asDownload ? "attachment" : "inline"}; filename="${resolved.filename}"`;
+
+    const rangeHeader = req.headers.get("range");
+    if (rangeHeader && !asDownload) {
+      const m = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+      if (m) {
+        const start = m[1] ? parseInt(m[1], 10) : 0;
+        const end = m[2] ? Math.min(total - 1, parseInt(m[2], 10)) : total - 1;
+        if (start >= 0 && start <= end && end < total) {
+          const chunkSize = end - start + 1;
+          const nodeStream = fs.createReadStream(resolved.filePath, { start, end });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return new NextResponse(Readable.toWeb(nodeStream) as any, {
+            status: 206,
+            headers: {
+              "Content-Type": mime,
+              "Content-Length": String(chunkSize),
+              "Content-Range": `bytes ${start}-${end}/${total}`,
+              "Accept-Ranges": "bytes",
+              "Content-Disposition": disposition,
+            },
+          });
+        }
+      }
+    }
+
+    const nodeStream = fs.createReadStream(resolved.filePath);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new NextResponse(Readable.toWeb(nodeStream) as any, {
+      status: 200,
       headers: {
-        "Content-Type": "audio/wav",
+        "Content-Type": mime,
+        "Content-Length": String(total),
+        "Accept-Ranges": "bytes",
         "Content-Disposition": disposition,
       },
     });
+  } catch (err) {
+    return NextResponse.json(
+      { detail: err instanceof Error ? err.message : "Failed to download media asset" },
+      { status: 500 }
+    );
   }
-
-  const header = Buffer.from("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom", "binary");
-  const meta = Buffer.from(`MediaSphere asset\nTitle: ${job.title}\nJob: ${id}\n`, "utf8");
-  const pad = Buffer.alloc(50_000);
-  const payload = Buffer.concat([header, meta, pad]);
-  return new NextResponse(new Uint8Array(payload), {
-    headers: {
-      "Content-Type": ext === "webm" ? "video/webm" : "video/mp4",
-      "Content-Disposition": disposition,
-    },
-  });
 }

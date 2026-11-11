@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { extractUrls } from "@/lib/serverlessEngine";
+import { extractUrlsReal } from "@/lib/serverlessEngine";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function POST(req: Request) {
   try {
@@ -13,7 +17,8 @@ export async function POST(req: Request) {
         { status: 422 }
       );
     }
-    return NextResponse.json(extractUrls(rawUrls));
+    const result = await extractUrlsReal(rawUrls);
+    return NextResponse.json(result);
   } catch {
     return NextResponse.json({ detail: "Invalid JSON body" }, { status: 400 });
   }

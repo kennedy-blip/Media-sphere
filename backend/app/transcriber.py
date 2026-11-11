@@ -1,10 +1,16 @@
 """
-AI Transcription Subsystem: Faster-Whisper STT + LLM summarizer wrapper.
-Falls back to deterministic mock transcript when model/GPU unavailable.
+AI Transcription Subsystem:
+1. Real platform timed captions via yt-dlp (fastest & exact when creator/auto captions exist).
+2. Faster-Whisper STT on downloaded audio when captions are absent.
+3. Grounded extractive summarizer over real transcript/metadata (test mock only when MEDIASPHERE_TEST_MOCK=true).
 """
 from __future__ import annotations
 
-import hashlib
+import os
+from typing import Any
+
+from .extractor import extract_platform_subtitles, is_test_mock_enabled
+from .processor import parse_timestamp
 
 try:
     from faster_whisper import WhisperModel  # type: ignore
@@ -12,90 +18,109 @@ try:
 except ImportError:
     HAS_WHISPER = False
 
-_model = None
+_model: Any = None
 
 
 def _get_model():
     global _model
-    if _model is None and HAS_WHISPER:
+    if _model is None and HAS_WHISPER and not is_test_mock_enabled():
         try:
-            _model = WhisperModel("small", device="cpu", compute_type="int8")
+            model_size = os.environ.get("WHISPER_MODEL_SIZE", "base")
+            _model = WhisperModel(model_size, device="cpu", compute_type="int8")
         except Exception:
             _model = False
     return _model if _model else None
 
 
-def transcribe_audio(audio_path: str, job_id: str = "") -> dict:
-    """Transcribe audio file. Returns {transcript, srt, summary, segments}."""
-    model = _get_model()
-    if model is not None:
-        try:
-            segments, info = model.transcribe(audio_path, beam_size=5)
-            seg_list = list(segments)
-            transcript = " ".join(s.text.strip() for s in seg_list)
-            srt_lines = []
-            for i, s in enumerate(seg_list, 1):
-                srt_lines.append(f"{i}\n{_fmt_srt(s.start)} --> {_fmt_srt(s.end)}\n{s.text.strip()}\n")
-            summary = _summarize(transcript)
-            return {"transcript": transcript, "srt": "\n".join(srt_lines), "summary": summary,
-                    "segments": [{"start": s.start, "end": s.end, "text": s.text} for s in seg_list]}
-        except Exception:
-            pass
-    return _mock_transcript(job_id)
-
-
 def _fmt_srt(seconds: float) -> str:
+    seconds = max(0.0, seconds)
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    ms = int(round((seconds - int(seconds)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{min(999, ms):03d}"
 
 
-def _mock_transcript(job_id: str) -> dict:
-    h = hashlib.md5((job_id or "mediasphere").encode()).hexdigest()
-    seed = int(h[:6], 16)
-    openings = [
-        "In this section, we cover the fundamentals and why they matter for creators today.",
-        "Welcome back to the channel. Today we're diving deep into a topic that's been trending everywhere.",
-        "So the first thing you need to understand is how this actually works under the hood.",
-        "Let me show you exactly how to get started, step by step, with real examples.",
-    ]
-    bodies = [
-        "The key insight is that consistency beats perfection every single time. Small daily improvements compound into massive results over months.",
-        "We look at the data, we test different approaches, and we double down on what works. No fluff, just what actually moves the needle.",
-        "Here's where most people get stuck — and here's the simple framework that fixes it in under five minutes.",
-        "Think about it from the viewer's perspective. What would make you stop scrolling and actually watch?",
-    ]
-    closings = [
-        "If you found this helpful, drop a comment and subscribe for more. See you in the next one.",
-        "That's a wrap for today. Links and resources are in the description below.",
-        "Thanks for watching — let me know in the comments what you want to see next.",
-    ]
-    transcript = f"{openings[seed % len(openings)]} {bodies[(seed >> 3) % len(bodies)]} {closings[(seed >> 5) % len(closings)]}"
+def _cues_to_srt(cues: list[dict[str, Any]]) -> str:
+    lines = []
+    for idx, c in enumerate(cues, 1):
+        lines.append(f"{idx}\n{_fmt_srt(c['start'])} --> {_fmt_srt(c['end'])}\n{c['text'].strip()}\n")
+    return "\n".join(lines)
+
+
+def transcribe_audio(
+    audio_path: str,
+    job_id: str = "",
+    source_url: str = "",
+    meta: dict[str, Any] | None = None,
+    trim_start: str | None = None,
+    trim_end: str | None = None,
+) -> dict[str, Any]:
+    """Produce real transcript, .SRT, and summary from captions or Faster-Whisper STT."""
+    if is_test_mock_enabled():
+        txt = f"Test transcript fixture for job {job_id}."
+        srt = f"1\n00:00:00,000 --> 00:00:05,000\n{txt}\n"
+        return {"transcript": txt, "srt": srt, "summary": f"Summary: {txt}", "segments": []}
+
+    cues: list[dict[str, Any]] = []
+    if source_url:
+        cues = extract_platform_subtitles(source_url)
+        if cues and (trim_start or trim_end):
+            lo = parse_timestamp(trim_start) if trim_start else 0.0
+            hi = parse_timestamp(trim_end) if trim_end else float("inf")
+            sliced = [
+                {
+                    "start": max(0.0, c["start"] - lo),
+                    "end": max(0.2, min(hi, c["end"]) - lo),
+                    "text": c["text"],
+                }
+                for c in cues
+                if c["end"] >= lo and c["start"] <= hi
+            ]
+            if sliced:
+                cues = sliced
+
+    if not cues:
+        model = _get_model()
+        if model is not None and os.path.exists(audio_path):
+            try:
+                segments, _ = model.transcribe(audio_path, beam_size=5)
+                for s in segments:
+                    if s.text and s.text.strip():
+                        cues.append({"start": float(s.start), "end": float(s.end), "text": s.text.strip()})
+            except Exception:
+                pass
+
+    title = (meta or {}).get("title") or "Media"
+    creator = (meta or {}).get("creator") or "Creator"
+    desc = (meta or {}).get("description") or ""
+
+    if cues:
+        transcript = " ".join(c["text"] for c in cues)
+        srt = _cues_to_srt(cues)
+        summary = _summarize(transcript, title, creator)
+        return {"transcript": transcript, "srt": srt, "summary": summary, "segments": cues}
+
+    fallback_text = desc[:1500].strip() if desc else None
     summary = (
-        "Key points: (1) Fundamentals matter more than advanced tricks. "
-        "(2) Consistency and small daily improvements compound over time. "
-        "(3) Test approaches with real data and double down on winners. "
-        "(4) Optimize for the viewer — stop the scroll, deliver value fast."
+        f'"{title}" by {creator}. '
+        + (fallback_text[:300] if fallback_text else "No spoken caption track detected on source media.")
     )
     srt = (
-        "1\n00:00:00,000 --> 00:00:05,000\n" + openings[seed % len(openings)] + "\n\n"
-        "2\n00:00:05,000 --> 00:00:12,000\n" + bodies[(seed >> 3) % len(bodies)] + "\n\n"
-        "3\n00:00:12,000 --> 00:00:17,000\n" + closings[(seed >> 5) % len(closings)] + "\n"
+        _cues_to_srt([{"start": 0.0, "end": 10.0, "text": fallback_text[:200]}])
+        if fallback_text
+        else None
     )
-    return {"transcript": transcript, "srt": srt, "summary": summary, "segments": []}
+    return {"transcript": fallback_text, "srt": srt, "summary": summary, "segments": []}
 
 
-def _summarize(text: str) -> str:
-    """LLM prompt wrapper stub — extractive summary (replace with LLM call in production)."""
-    sentences = [s.strip() for s in text.replace("?", ".").split(".") if s.strip()]
+def _summarize(text: str, title: str, creator: str) -> str:
+    sentences = [s.strip() for s in text.replace("?", ".").replace("!", ".").split(".") if len(s.strip()) >= 20]
     if not sentences:
-        return "No speech detected."
-    # Simple extractive: first + middle + last sentence
+        return f'"{title}" ({creator}): {text[:320]}'
     picks = [sentences[0]]
     if len(sentences) > 2:
         picks.append(sentences[len(sentences) // 2])
     if len(sentences) > 1:
         picks.append(sentences[-1])
-    return " ".join(picks) + "."
+    return f'{title} ({creator}): {". ".join(picks)}.'

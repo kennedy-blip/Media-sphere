@@ -1,6 +1,6 @@
 """
-Job queue: Redis/Celery when available, in-memory threaded executor otherwise.
-Emits real-time progress snapshots to all connected WebSocket subscribers.
+Job queue: Redis/Celery when available, threaded executor otherwise.
+Runs real yt-dlp + FFmpeg + subtitle/Whisper pipeline (test mock only when MEDIASPHERE_TEST_MOCK=true).
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from .extractor import download_stream, extract_metadata
+from .extractor import download_stream, extract_metadata, is_test_mock_enabled
 from .processor import (
     STORAGE_DIR,
     cleanup_old_files,
@@ -37,7 +37,6 @@ REDIS_JOBS_KEY = "mediasphere:jobs"
 jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
-# Multi-subscriber WebSocket fan-out: list of (loop, asyncio.Queue)
 Subscriber = tuple[asyncio.AbstractEventLoop, asyncio.Queue]
 _subscribers: set[Subscriber] = set()
 _sub_lock = threading.Lock()
@@ -120,7 +119,7 @@ def create_job(
         "url": url,
         "sanitized_url": sanitized_url,
         "platform": platform,
-        "title": "Extracting…",
+        "title": "Extracting live metadata…",
         "status": "queued",
         "progress": 0.0,
         "resolution": resolution,
@@ -191,7 +190,6 @@ def _update(job_id: str, **kwargs) -> dict | None:
 
 
 def run_job(job_id: str) -> dict | None:
-    """Pipeline: queued -> extracting -> trimming -> transcribing -> ready (or cancelled/failed)."""
     job = get_job(job_id)
     if not job:
         return None
@@ -206,8 +204,8 @@ def run_job(job_id: str) -> dict | None:
         want_subs = bool(job.get("generate_subtitles"))
         want_summary = bool(job.get("generate_summary"))
 
-        # Stage 1: Extracting
-        _update(job_id, status="extracting", progress=5.0)
+        # Stage 1: Real metadata extraction
+        _update(job_id, status="extracting", progress=8.0)
         meta = extract_metadata(sanitized, platform)
         if _is_cancelled(job_id):
             return _update(job_id, status="cancelled")
@@ -217,63 +215,75 @@ def run_job(job_id: str) -> dict | None:
             thumbnail=meta.get("thumbnail"),
             creator=meta.get("creator"),
             duration=meta.get("duration"),
-            progress=25.0,
+            progress=22.0,
         )
 
-        # Stage 2: Downloading / FFmpeg Trimming & Conversion
-        _update(job_id, status="trimming", progress=30.0)
-        raw_path = download_stream(sanitized, STORAGE_DIR, job_id, resolution, fmt)
-
-        for p in range(35, 80, 5):
-            if _is_cancelled(job_id):
-                return _update(job_id, status="cancelled", speed_mbps=0.0, eta_seconds=None)
-            _update(
-                job_id,
-                progress=float(p),
-                speed_mbps=round(2.4 + (p % 7) * 0.7, 1),
-                eta_seconds=max(1, int((100 - p) * 0.35)),
-            )
-            time.sleep(0.22)
-
+        # Stage 2: Real stream download + FFmpeg trimming & conversion
+        _update(job_id, status="trimming", progress=26.0)
         final_path = os.path.join(STORAGE_DIR, f"{job_id}.{fmt}")
-        processed_ok = False
-        if raw_path and os.path.exists(raw_path) and has_ffmpeg():
-            if trim_start or trim_end:
-                trimmed_path = os.path.join(STORAGE_DIR, f"{job_id}_trim.{fmt}")
-                if trim_media(raw_path, trimmed_path, trim_start, trim_end):
-                    processed_ok = convert_media(trimmed_path, final_path, fmt)
-                    try:
-                        os.remove(trimmed_path)
-                    except OSError:
-                        pass
+
+        if is_test_mock_enabled():
+            for p in (40.0, 65.0, 78.0):
+                if _is_cancelled(job_id):
+                    return _update(job_id, status="cancelled", speed_mbps=0.0, eta_seconds=None)
+                _update(job_id, progress=p, speed_mbps=3.5, eta_seconds=1)
+                time.sleep(0.1)
+            final_path = create_placeholder_file(job_id, meta["title"], fmt, meta.get("duration") or 120)
+        else:
+            def _on_dl_progress(pct: float, speed: float, eta: int | None):
+                _update(job_id, progress=pct, speed_mbps=speed, eta_seconds=eta)
+
+            raw_path = download_stream(sanitized, STORAGE_DIR, job_id, resolution, fmt, progress_cb=_on_dl_progress)
+            if not raw_path or not os.path.exists(raw_path):
+                raise RuntimeError("Failed to download media stream from source")
+
+            if _is_cancelled(job_id):
+                try:
+                    os.remove(raw_path)
+                except OSError:
+                    pass
+                return _update(job_id, status="cancelled", speed_mbps=0.0, eta_seconds=None)
+
+            _update(job_id, progress=78.0, speed_mbps=0.0, eta_seconds=2)
+            processed_ok = False
+            if has_ffmpeg():
+                if trim_start or trim_end:
+                    trimmed_path = os.path.join(STORAGE_DIR, f"{job_id}_trim.{os.path.splitext(raw_path)[1].lstrip('.') or 'mp4'}")
+                    if trim_media(raw_path, trimmed_path, trim_start, trim_end):
+                        processed_ok = convert_media(trimmed_path, final_path, fmt)
+                        try:
+                            os.remove(trimmed_path)
+                        except OSError:
+                            pass
+                else:
+                    processed_ok = convert_media(raw_path, final_path, fmt)
             else:
-                processed_ok = convert_media(raw_path, final_path, fmt)
+                os.replace(raw_path, final_path)
+                processed_ok = True
+
             try:
-                if raw_path != final_path and os.path.exists(raw_path):
+                if os.path.exists(raw_path) and os.path.abspath(raw_path) != os.path.abspath(final_path):
                     os.remove(raw_path)
             except OSError:
                 pass
 
-        if not processed_ok or not os.path.exists(final_path):
-            final_path = create_placeholder_file(
-                job_id, meta["title"], fmt, meta.get("duration") or 300
-            )
+            if not processed_ok or not os.path.exists(final_path):
+                raise RuntimeError("FFmpeg trimming/conversion failed on downloaded stream")
 
-        try:
-            size = os.path.getsize(final_path)
-        except OSError:
-            size = 50_000
+        size = os.path.getsize(final_path)
 
-        # Stage 3: Faster-Whisper Transcription + Summary (if AI toggles enabled)
+        # Stage 3: Captions / Whisper STT + Summary
         transcript = summary = srt = None
         if want_subs or want_summary:
-            _update(job_id, status="transcribing", progress=82.0)
-            for p in range(84, 97, 4):
-                if _is_cancelled(job_id):
-                    return _update(job_id, status="cancelled", speed_mbps=0.0, eta_seconds=None)
-                _update(job_id, progress=float(p), eta_seconds=max(1, int((100 - p) * 0.25)))
-                time.sleep(0.18)
-            result = transcribe_audio(final_path, job_id)
+            _update(job_id, status="transcribing", progress=86.0, speed_mbps=0.0, eta_seconds=2)
+            result = transcribe_audio(
+                final_path,
+                job_id=job_id,
+                source_url=sanitized,
+                meta=meta,
+                trim_start=trim_start,
+                trim_end=trim_end,
+            )
             transcript = result.get("transcript")
             srt = result.get("srt") if want_subs else None
             summary = result.get("summary") if want_summary else None

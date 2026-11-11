@@ -9,11 +9,15 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^5.2.1",
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "lucide-react": "^0.469.0",
     "next": "^15.5.29",
     "react": "^19.2.9",
     "react-dom": "^19.2.9",
     "socket.io-client": "^4.8.1",
+    "youtube-caption-extractor": "^1.10.3",
+    "youtubei.js": "^18.3.0",
     "zustand": "^5.0.2"
   },
   "devDependencies": {

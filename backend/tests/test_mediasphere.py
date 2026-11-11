@@ -2,27 +2,42 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
+os.environ["MEDIASPHERE_TEST_MOCK"] = "true"
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from fastapi.testclient import TestClient  # type: ignore
 from main import app  # type: ignore
-from app.sanitizer import parse_batch_input, strip_tracking_params, validate_url  # type: ignore
+from app.processor import convert_media, get_ffmpeg_bin, has_ffmpeg, trim_media  # type: ignore
+from app.sanitizer import (  # type: ignore
+    extract_youtube_video_id,
+    parse_batch_input,
+    strip_tracking_params,
+    validate_url,
+)
 
 
 class SanitizerTests(unittest.TestCase):
-    def test_strips_tracking_parameters(self):
+    def test_strips_tracking_and_youtube_mix_parameters(self):
         cleaned = strip_tracking_params(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=shared&utm_source=x&si=abc123"
         )
         self.assertEqual(cleaned, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
+        # User's exact YouTube Radio/Mix URL
+        mix_cleaned = strip_tracking_params("https://youtu.be/c8zq4kAn_O0?list=RDc8zq4kAn_O0")
+        self.assertEqual(mix_cleaned, "https://youtu.be/c8zq4kAn_O0")
+        self.assertEqual(extract_youtube_video_id(mix_cleaned), "c8zq4kAn_O0")
+
     def test_platforms_and_mobile_subdomains(self):
         cases = [
             ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"),
+            ("https://youtu.be/c8zq4kAn_O0?list=RDc8zq4kAn_O0", "youtube"),
             ("https://m.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"),
             ("https://youtu.be/dQw4w9WgXcQ?si=track", "youtube"),
             ("https://www.tiktok.com/@techbrand/video/734567?is_from_webapp=1", "tiktok"),
@@ -59,6 +74,31 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(len(urls), 3)
 
 
+class FfmpegProcessorTests(unittest.TestCase):
+    def test_real_ffmpeg_trim_and_mp3_conversion(self):
+        self.assertTrue(has_ffmpeg(), "Bundled imageio-ffmpeg binary must be available")
+        ffmpeg = get_ffmpeg_bin()
+        assert ffmpeg is not None
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.mp4")
+            trimmed = os.path.join(tmp, "trimmed.mp4")
+            mp3_out = os.path.join(tmp, "out.mp3")
+            subprocess.run(
+                [
+                    ffmpeg, "-y",
+                    "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=4",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                    src,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            self.assertTrue(trim_media(src, trimmed, "00:01", "00:03", use_stream_copy=False))
+            self.assertTrue(convert_media(trimmed, mp3_out, "mp3"))
+            self.assertGreater(os.path.getsize(mp3_out), 1000)
+
+
 class ApiGatewayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -74,7 +114,7 @@ class ApiGatewayTests(unittest.TestCase):
             "/api/v1/extract",
             json={
                 "urls": [
-                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&utm_source=test",
+                    "https://youtu.be/c8zq4kAn_O0?list=RDc8zq4kAn_O0",
                     "https://www.instagram.com/reel/C3xY9z0A1bC/?igsh=MZRlODBiNWFlZA==",
                     "https://evil.com/malware",
                 ]
@@ -84,7 +124,7 @@ class ApiGatewayTests(unittest.TestCase):
         body = r.json()
         self.assertEqual(body["count"], 3)
         self.assertEqual(body["valid_count"], 2)
-        self.assertEqual(body["previews"][0]["sanitized_url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(body["previews"][0]["sanitized_url"], "https://youtu.be/c8zq4kAn_O0")
         self.assertFalse(body["previews"][2]["valid"])
 
     def test_trim_and_resolution_validation(self):
@@ -113,7 +153,7 @@ class ApiGatewayTests(unittest.TestCase):
         r = self.client.post(
             "/api/v1/jobs",
             json={
-                "url": "https://www.tiktok.com/@techbrand/video/7345678901234?is_from_webapp=1",
+                "url": "https://youtu.be/c8zq4kAn_O0?list=RDc8zq4kAn_O0",
                 "resolution": "audio",
                 "format": "wav",
                 "trim_start": "00:10",
@@ -138,7 +178,7 @@ class ApiGatewayTests(unittest.TestCase):
         assert final is not None
         self.assertIsNotNone(final["transcript"])
         self.assertIsNotNone(final["srt"])
-        self.assertIsNone(final["summary"])  # generate_summary was False
+        self.assertIsNone(final["summary"])
 
         dl = self.client.get(f"/api/v1/jobs/{job_id}/download?download=true")
         self.assertEqual(dl.status_code, 200)

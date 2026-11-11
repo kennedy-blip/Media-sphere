@@ -1,62 +1,89 @@
 /**
- * Serverless fallback engine used when deployed standalone (e.g. Vercel without an external FastAPI URL).
- * Combines `/tmp` warm-instance persistence with compact self-decoding job tokens in `job.id`
- * (`<6hex>-<base64url>`) so jobs, transcripts, SRTs, and file downloads work reliably even across
- * separate cold-started Vercel Serverless Function instances.
+ * Real-world serverless job engine for Next.js App Router & Vercel Fluid Compute.
+ * Uses real multi-platform metadata extraction, real stream downloading,
+ * real @ffmpeg-installer/ffmpeg trimming/conversion, and real caption/SRT extraction.
  */
 import crypto from "crypto";
 import fs from "fs";
 import { detectPlatform, validateUrl } from "./sanitizer";
 import { validateTrimRange, type Job, type Preview } from "./api";
+import { extractRealMetadata, type ExtractedMetadata } from "./realExtractor";
+import { downloadAndProcessRealMedia, getCachedMediaPath } from "./realProcessor";
+import { extractRealTranscriptAndSummary } from "./realTranscriber";
 
 const ALLOWED_RESOLUTIONS = new Set(["1080p", "720p", "480p", "360p", "2160p", "4k", "best", "audio"]);
 const ALLOWED_FORMATS = new Set(["mp4", "webm", "mp3", "wav"]);
-const TMP_STORE_PATH = "/tmp/mediasphere_jobs.json";
+const TMP_STORE_PATH = "/tmp/mediasphere_jobs_v2.json";
 
 interface StoredJob extends Job {
   createdAtMs: number;
   cancelledFlag: boolean;
+  fileKey: string;
 }
 
-interface CompactToken {
-  t: number; // createdAtMs
-  u: string; // sanitized_url
-  r: string; // resolution
-  f: string; // format
+export interface CompactToken {
+  t: number;  // createdAtMs
+  u: string;  // sanitized_url
+  r: string;  // resolution
+  f: string;  // format
   s?: string; // trim_start
   e?: string; // trim_end
-  b: 0 | 1; // generate_subtitles
-  m: 0 | 1; // generate_summary
+  b: 0 | 1;   // generate_subtitles
+  m: 0 | 1;   // generate_summary
 }
 
-const g = globalThis as unknown as { __mediasphereJobs?: Map<string, StoredJob> };
-if (!g.__mediasphereJobs) {
-  g.__mediasphereJobs = new Map<string, StoredJob>();
+const g = globalThis as unknown as {
+  __mediasphereRealJobs?: Map<string, StoredJob>;
+  __mediasphereRunningJobs?: Set<string>;
+};
+if (!g.__mediasphereRealJobs) g.__mediasphereRealJobs = new Map<string, StoredJob>();
+if (!g.__mediasphereRunningJobs) g.__mediasphereRunningJobs = new Set<string>();
+
+const store = g.__mediasphereRealJobs;
+const running = g.__mediasphereRunningJobs;
+
+export function computeFileKey(params: {
+  url: string;
+  resolution: string;
+  format: string;
+  trimStart: string | null;
+  trimEnd: string | null;
+}): string {
+  return crypto
+    .createHash("md5")
+    .update(`${params.url}|${params.resolution}|${params.format}|${params.trimStart || ""}|${params.trimEnd || ""}`)
+    .digest("hex")
+    .slice(0, 16);
 }
-const store = g.__mediasphereJobs;
 
 function syncFromDisk() {
   try {
     if (fs.existsSync(TMP_STORE_PATH)) {
       const raw = JSON.parse(fs.readFileSync(TMP_STORE_PATH, "utf8")) as StoredJob[];
       for (const item of raw) {
-        const existing = store.get(item.id);
-        if (!existing || item.cancelledFlag) {
+        const cur = store.get(item.id);
+        if (
+          !cur ||
+          item.updated_at > cur.updated_at ||
+          item.status === "ready" ||
+          item.status === "failed" ||
+          item.cancelledFlag
+        ) {
           store.set(item.id, item);
         }
       }
     }
   } catch {
-    /* ignore disk sync errors */
+    /* ignore */
   }
 }
 
 function syncToDisk() {
   try {
-    const items = Array.from(store.values()).slice(-100);
+    const items = Array.from(store.values()).slice(-80);
     fs.writeFileSync(TMP_STORE_PATH, JSON.stringify(items), "utf8");
   } catch {
-    /* ignore read-only fs errors */
+    /* ignore */
   }
 }
 
@@ -66,173 +93,142 @@ function encodeJobId(token: CompactToken): string {
   return `${prefix}-${payload}`;
 }
 
-function decodeJobFromId(id: string): StoredJob | null {
+export function decodeTokenFromId(id: string): CompactToken | null {
   const dash = id.indexOf("-");
   if (dash !== 6) return null;
   try {
     const json = Buffer.from(id.slice(7), "base64url").toString("utf8");
     const t = JSON.parse(json) as CompactToken;
     if (!t || typeof t.u !== "string" || typeof t.t !== "number") return null;
-    const host = new URL(t.u).hostname;
-    const platform = detectPlatform(host);
-    const meta = buildMockMetadata(t.u, platform);
-    const createdIso = new Date(t.t).toISOString();
-    return {
-      id,
-      url: t.u,
-      sanitized_url: t.u,
-      platform,
-      title: meta.title,
-      status: "queued",
-      progress: 5,
-      resolution: t.r || "1080p",
-      format: t.f || "mp4",
-      trim_start: t.s ?? null,
-      trim_end: t.e ?? null,
-      generate_subtitles: Boolean(t.b),
-      generate_summary: Boolean(t.m),
-      speed_mbps: 0,
-      eta_seconds: 3,
-      error: null,
-      created_at: createdIso,
-      updated_at: createdIso,
-      thumbnail: meta.thumbnail,
-      creator: meta.creator,
-      duration: meta.duration,
-      file_size: null,
-      download_url: null,
-      transcript: null,
-      summary: null,
-      srt: null,
-      createdAtMs: t.t,
-      cancelledFlag: false,
-    };
+    return t;
   } catch {
     return null;
   }
 }
 
-function md5Hex(input: string): string {
-  return crypto.createHash("md5").update(input).digest("hex");
-}
-
-export function buildMockMetadata(url: string, platform: string) {
-  const h = md5Hex(url);
-  const seed = parseInt(h.slice(0, 8), 16);
-  const titles: Record<string, string[]> = {
-    youtube: ["Building the Future of Media", "How AI Is Changing Video", "The Ultimate Creator Workflow", "Deep Dive: Platform Engineering"],
-    tiktok: ["POV: You found the best tool", "Wait for the drop", "This trick broke the internet", "Day in the life of a creator"],
-    instagram: ["Behind the scenes", "Golden hour reel", "New collection drop", "Weekend vibes"],
-    x: ["Thread: Why this matters", "Hot take on media", "Breaking: new feature", "Community update"],
-    reddit: ["Discussion: Best tools of 2026", "Showcase: My setup", "Ask: How do you edit?", "Megathread: Resources"],
-    pinterest: ["DIY Home Decor Ideas", "Minimalist Workspace", "Recipe Collection", "Travel Inspiration"],
-    vimeo: ["Short Film: Dawn", "Documentary Excerpt", "Showreel 2026", "Music Video"],
-    twitch: ["Speedrun World Record Attempt", "Chill Stream Highlights", "Esports Finals", "Creative Coding Session"],
-    facebook: ["Community Highlights", "Live Event Recap", "Family Moments", "Business Spotlight"],
-    linkedin: ["Leadership Lessons", "Industry Insights 2026", "Career Advice", "Startup Story"],
-  };
-  const creators: Record<string, string[]> = {
-    youtube: ["@techbrand", "@creatorlab", "@mediastack"],
-    tiktok: ["@techbrand", "@viral.creator", "@dailyvibes"],
-    instagram: ["@techbrand", "@visual.studio", "@wanderlust"],
-    x: ["@techbrand", "@buildinpublic", "@mediastack"],
-    reddit: ["u/techbrand", "u/creator_hub", "u/mediastack"],
-    pinterest: ["@techbrand", "@inspire.daily", "@homestudio"],
-    vimeo: ["@techbrand", "@filmworks", "@studio.north"],
-    twitch: ["@techbrand", "@gameon", "@streamlab"],
-    facebook: ["TechBrand", "Creator Hub", "MediaStack"],
-    linkedin: ["TechBrand", "MediaStack Inc", "Creator Lab"],
-  };
-  const tp = titles[platform] ?? titles.youtube;
-  const cp = creators[platform] ?? creators.youtube;
-  const title = tp[seed % tp.length];
-  const creator = cp[seed % cp.length];
-  const views = 1000 + (seed % 5_000_000);
-  const likes = Math.floor(views * 0.08);
-  const duration = 90 + (seed % 810);
-  return {
-    title,
-    description: `Extracted from ${platform} — ${title}. Sanitized media preview ready for trimming, conversion, and AI transcription.`,
-    creator,
-    avatar: `https://i.pravatar.cc/150?u=${h.slice(0, 12)}`,
-    thumbnail: `https://picsum.photos/seed/${h.slice(0, 8)}/640/360`,
-    views,
-    likes,
-    upload_date: "2026-10-15",
-    tags: ["media", "creator", "tech", "2026", platform, "viral", "trending"],
-    duration,
-    formats: [
-      { format_id: "bestvideo", label: "Best (4K)", ext: "mp4", resolution: "2160p", filesize: 150_000_000, fps: 60 },
-      { format_id: "1080p", label: "1080p", ext: "mp4", resolution: "1080p", filesize: 60_000_000, fps: 30 },
-      { format_id: "720p", label: "720p", ext: "mp4", resolution: "720p", filesize: 30_000_000, fps: 30 },
-      { format_id: "480p", label: "480p", ext: "mp4", resolution: "480p", filesize: 15_000_000, fps: 30 },
-      { format_id: "360p", label: "360p", ext: "mp4", resolution: "360p", filesize: 8_000_000, fps: 30 },
-      { format_id: "audio-320", label: "Audio 320kbps MP3", ext: "mp3", resolution: "audio", filesize: 4_000_000, abr: 320 },
-    ],
-  };
-}
-
-function buildTranscript(seedKey: string) {
-  const h = md5Hex(seedKey || "mediasphere");
-  const seed = parseInt(h.slice(0, 6), 16);
-  const openings = [
-    "In this section, we cover the fundamentals and why they matter for creators today.",
-    "Welcome back to the channel. Today we're diving deep into a topic that's been trending everywhere.",
-    "So the first thing you need to understand is how this actually works under the hood.",
-  ];
-  const bodies = [
-    "The key insight is that consistency beats perfection every single time. Small daily improvements compound into massive results over months.",
-    "We look at the data, test different approaches, and double down on what works. No fluff, just what actually moves the needle.",
-    "Here's where most people get stuck — and here's the simple framework that fixes it in under five minutes.",
-  ];
-  const closings = [
-    "If you found this helpful, drop a comment and subscribe for more.",
-    "That's a wrap for today. Links and resources are in the description below.",
-  ];
-  const o = openings[seed % openings.length];
-  const b = bodies[(seed >> 3) % bodies.length];
-  const c = closings[(seed >> 5) % closings.length];
-  return {
-    transcript: `${o} ${b} ${c}`,
-    summary:
-      "Key points: (1) Fundamentals matter more than advanced tricks. (2) Consistency compounds over time. (3) Validate with real data and optimize for viewer retention.",
-    srt: `1\n00:00:00,000 --> 00:00:05,000\n${o}\n\n2\n00:00:05,000 --> 00:00:12,000\n${b}\n\n3\n00:00:12,000 --> 00:00:17,000\n${c}\n`,
-  };
-}
-
-export function extractUrls(urls: string[]): { previews: Preview[]; count: number; valid_count: number } {
-  const previews: Preview[] = urls.map((raw) => {
-    const v = validateUrl(raw);
-    if (!v.valid || !v.sanitizedUrl || !v.platform) {
-      return {
-        url: raw,
-        sanitized_url: raw,
-        platform: "unknown",
-        valid: false,
-        error: v.error ?? "Invalid URL",
-        title: null,
-        description: null,
-        creator: null,
-        avatar: null,
-        thumbnail: null,
-        views: null,
-        likes: null,
-        upload_date: null,
-        tags: [],
-        duration: null,
-        formats: [],
-      };
-    }
-    const meta = buildMockMetadata(v.sanitizedUrl, v.platform);
-    return {
-      url: raw,
-      sanitized_url: v.sanitizedUrl,
-      platform: v.platform,
-      valid: true,
-      error: null,
-      ...meta,
-    };
+function reconstructJobFromToken(id: string, t: CompactToken): StoredJob {
+  const host = new URL(t.u).hostname;
+  const platform = detectPlatform(host);
+  const createdIso = new Date(t.t).toISOString();
+  const fileKey = computeFileKey({
+    url: t.u,
+    resolution: t.r || "1080p",
+    format: t.f || "mp4",
+    trimStart: t.s ?? null,
+    trimEnd: t.e ?? null,
   });
+  return {
+    id,
+    url: t.u,
+    sanitized_url: t.u,
+    platform,
+    title: "Extracting real metadata…",
+    status: "queued",
+    progress: 5,
+    resolution: t.r || "1080p",
+    format: t.f || "mp4",
+    trim_start: t.s ?? null,
+    trim_end: t.e ?? null,
+    generate_subtitles: Boolean(t.b),
+    generate_summary: Boolean(t.m),
+    speed_mbps: 0,
+    eta_seconds: null,
+    error: null,
+    created_at: createdIso,
+    updated_at: createdIso,
+    thumbnail: null,
+    creator: null,
+    duration: null,
+    file_size: null,
+    download_url: null,
+    transcript: null,
+    summary: null,
+    srt: null,
+    createdAtMs: t.t,
+    cancelledFlag: false,
+    fileKey,
+  };
+}
+
+function toPublicJob(j: StoredJob): Job {
+  const { createdAtMs: _c, cancelledFlag: _f, fileKey: _k, ...pub } = j;
+  void _c;
+  void _f;
+  void _k;
+  return pub;
+}
+
+function updateStoredJob(id: string, patch: Partial<StoredJob>): StoredJob | null {
+  const cur = store.get(id);
+  if (!cur) return null;
+  if (cur.cancelledFlag && patch.status !== "cancelled") return cur;
+  Object.assign(cur, patch, { updated_at: new Date().toISOString() });
+  store.set(id, cur);
+  syncToDisk();
+  return cur;
+}
+
+export async function extractUrlsReal(urls: string[]): Promise<{
+  previews: Preview[];
+  count: number;
+  valid_count: number;
+}> {
+  const previews = await Promise.all(
+    urls.map(async (raw): Promise<Preview> => {
+      const v = validateUrl(raw);
+      if (!v.valid || !v.sanitizedUrl || !v.platform) {
+        return {
+          url: raw,
+          sanitized_url: raw,
+          platform: "unknown",
+          valid: false,
+          error: v.error ?? "Invalid URL",
+          title: null,
+          description: null,
+          creator: null,
+          avatar: null,
+          thumbnail: null,
+          views: null,
+          likes: null,
+          upload_date: null,
+          tags: [],
+          duration: null,
+          formats: [],
+        };
+      }
+      try {
+        const meta = await extractRealMetadata(v.sanitizedUrl, v.platform);
+        return {
+          url: raw,
+          sanitized_url: v.sanitizedUrl,
+          platform: v.platform,
+          valid: true,
+          error: null,
+          ...meta,
+        };
+      } catch (err) {
+        return {
+          url: raw,
+          sanitized_url: v.sanitizedUrl,
+          platform: v.platform,
+          valid: false,
+          error: err instanceof Error ? err.message : "Failed to extract live metadata from source",
+          title: null,
+          description: null,
+          creator: null,
+          avatar: null,
+          thumbnail: null,
+          views: null,
+          likes: null,
+          upload_date: null,
+          tags: [],
+          duration: null,
+          formats: [],
+        };
+      }
+    })
+  );
+
   return {
     previews,
     count: previews.length,
@@ -266,45 +262,6 @@ export function validateJobOptions(body: {
   return { ok: true, resolution, format, trim_start: ts || null, trim_end: te || null };
 }
 
-function materialize(j: StoredJob): Job {
-  if (!j.cancelledFlag && j.status !== "ready" && j.status !== "failed" && j.status !== "cancelled") {
-    const elapsed = Date.now() - j.createdAtMs;
-    const nowIso = new Date().toISOString();
-    if (elapsed < 800) {
-      j.status = "extracting";
-      j.progress = 20;
-      j.speed_mbps = 3.2;
-      j.eta_seconds = 3;
-    } else if (elapsed < 2200) {
-      j.status = "trimming";
-      j.progress = Math.min(78, 30 + Math.floor((elapsed - 800) / 28));
-      j.speed_mbps = 4.6;
-      j.eta_seconds = 2;
-    } else if ((j.generate_subtitles || j.generate_summary) && elapsed < 3400) {
-      j.status = "transcribing";
-      j.progress = 90;
-      j.speed_mbps = 1.8;
-      j.eta_seconds = 1;
-    } else {
-      const ai = j.generate_subtitles || j.generate_summary ? buildTranscript(j.sanitized_url) : null;
-      j.status = "ready";
-      j.progress = 100;
-      j.speed_mbps = 0;
-      j.eta_seconds = 0;
-      j.file_size = ["mp3", "wav"].includes(j.format) ? 88244 : 50136;
-      j.download_url = `/api/v1/jobs/${j.id}/download`;
-      j.transcript = ai ? ai.transcript : null;
-      j.srt = j.generate_subtitles && ai ? ai.srt : null;
-      j.summary = j.generate_summary && ai ? ai.summary : null;
-    }
-    j.updated_at = nowIso;
-  }
-  const { createdAtMs: _c, cancelledFlag: _f, ...pub } = j;
-  void _c;
-  void _f;
-  return pub;
-}
-
 export function createServerlessJob(params: {
   url: string;
   sanitized_url: string;
@@ -328,16 +285,22 @@ export function createServerlessJob(params: {
     b: params.generate_subtitles ? 1 : 0,
     m: params.generate_summary ? 1 : 0,
   });
-  const meta = buildMockMetadata(params.sanitized_url, params.platform);
+  const fileKey = computeFileKey({
+    url: params.sanitized_url,
+    resolution: params.resolution,
+    format: params.format,
+    trimStart: params.trim_start,
+    trimEnd: params.trim_end,
+  });
   const nowIso = new Date(createdAtMs).toISOString();
   const job: StoredJob = {
     id,
     url: params.url,
     sanitized_url: params.sanitized_url,
     platform: params.platform,
-    title: meta.title,
-    status: "queued",
-    progress: 5,
+    title: "Extracting live stream…",
+    status: "extracting",
+    progress: 8,
     resolution: params.resolution,
     format: params.format,
     trim_start: params.trim_start,
@@ -345,13 +308,13 @@ export function createServerlessJob(params: {
     generate_subtitles: params.generate_subtitles,
     generate_summary: params.generate_summary,
     speed_mbps: 0,
-    eta_seconds: 3,
+    eta_seconds: null,
     error: null,
     created_at: nowIso,
     updated_at: nowIso,
-    thumbnail: meta.thumbnail,
-    creator: meta.creator,
-    duration: meta.duration,
+    thumbnail: null,
+    creator: null,
+    duration: null,
     file_size: null,
     download_url: null,
     transcript: null,
@@ -359,42 +322,211 @@ export function createServerlessJob(params: {
     srt: null,
     createdAtMs,
     cancelledFlag: false,
+    fileKey,
   };
   store.set(id, job);
   syncToDisk();
-  return materialize(job);
+  return toPublicJob(job);
+}
+
+export async function runRealServerlessJob(id: string): Promise<void> {
+  if (running.has(id)) return;
+  syncFromDisk();
+  let j = store.get(id) ?? null;
+  if (!j) {
+    const token = decodeTokenFromId(id);
+    if (!token) return;
+    j = reconstructJobFromToken(id, token);
+    store.set(id, j);
+    syncToDisk();
+  }
+  if (j.status === "ready" || j.status === "cancelled" || j.cancelledFlag) return;
+
+  running.add(id);
+  try {
+    updateStoredJob(id, { status: "extracting", progress: 12 });
+    const meta: ExtractedMetadata = await extractRealMetadata(j.sanitized_url, j.platform);
+
+    syncFromDisk();
+    if (store.get(id)?.cancelledFlag) return;
+
+    updateStoredJob(id, {
+      title: meta.title,
+      thumbnail: meta.thumbnail,
+      creator: meta.creator,
+      duration: meta.duration,
+      status: "trimming",
+      progress: 24,
+      eta_seconds: 6,
+    });
+
+    const mediaResult = await downloadAndProcessRealMedia({
+      fileKey: j.fileKey,
+      url: j.sanitized_url,
+      platform: j.platform,
+      resolution: j.resolution,
+      format: j.format,
+      trimStart: j.trim_start,
+      trimEnd: j.trim_end,
+      onProgress: (p) => {
+        updateStoredJob(id, {
+          status: "trimming",
+          progress: p.progress,
+          speed_mbps: p.speedMbps,
+          eta_seconds: p.etaSeconds,
+        });
+      },
+    });
+
+    syncFromDisk();
+    if (store.get(id)?.cancelledFlag) return;
+
+    let transcript: string | null = null;
+    let srt: string | null = null;
+    let summary: string | null = null;
+
+    if (j.generate_subtitles || j.generate_summary) {
+      updateStoredJob(id, { status: "transcribing", progress: 86, speed_mbps: 0, eta_seconds: 2 });
+      const ai = await extractRealTranscriptAndSummary({
+        url: j.sanitized_url,
+        platform: j.platform,
+        meta,
+        trimStart: j.trim_start,
+        trimEnd: j.trim_end,
+        wantSubtitles: Boolean(j.generate_subtitles),
+        wantSummary: Boolean(j.generate_summary),
+      });
+      transcript = ai.transcript;
+      srt = ai.srt;
+      summary = ai.summary;
+    }
+
+    updateStoredJob(id, {
+      status: "ready",
+      progress: 100,
+      speed_mbps: 0,
+      eta_seconds: 0,
+      file_size: mediaResult.fileSize,
+      download_url: `/api/v1/jobs/${id}/download`,
+      transcript,
+      srt,
+      summary,
+    });
+  } catch (err) {
+    updateStoredJob(id, {
+      status: "failed",
+      error: err instanceof Error ? err.message : "Media processing failed",
+      speed_mbps: 0,
+      eta_seconds: null,
+    });
+  } finally {
+    running.delete(id);
+  }
 }
 
 export function listServerlessJobs(): Job[] {
   syncFromDisk();
   return Array.from(store.values())
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
-    .map(materialize);
+    .map(toPublicJob);
 }
 
-export function getServerlessJob(id: string): Job | null {
+export function getServerlessJob(id: string): { job: Job | null; needsRun: boolean } {
   syncFromDisk();
   let j = store.get(id) ?? null;
   if (!j) {
-    j = decodeJobFromId(id);
-    if (j) {
+    const token = decodeTokenFromId(id);
+    if (token) {
+      j = reconstructJobFromToken(id, token);
+      // Check if media file already exists on this instance
+      const cached = getCachedMediaPath(j.fileKey, j.format);
+      if (cached && fs.existsSync(cached)) {
+        j.status = "ready";
+        j.progress = 100;
+        j.file_size = fs.statSync(cached).size;
+        j.download_url = `/api/v1/jobs/${id}/download`;
+      }
       store.set(id, j);
       syncToDisk();
     }
   }
-  return j ? materialize(j) : null;
+  if (!j) return { job: null, needsRun: false };
+  const needsRun =
+    !running.has(id) &&
+    !j.cancelledFlag &&
+    !["ready", "failed", "cancelled"].includes(j.status);
+  return { job: toPublicJob(j), needsRun };
+}
+
+export async function ensureDownloadableFile(id: string): Promise<{
+  filePath: string;
+  filename: string;
+  format: string;
+} | null> {
+  syncFromDisk();
+  let j = store.get(id) ?? null;
+  if (!j) {
+    const token = decodeTokenFromId(id);
+    if (!token) return null;
+    j = reconstructJobFromToken(id, token);
+    store.set(id, j);
+  }
+
+  let cached = getCachedMediaPath(j.fileKey, j.format);
+  if (!cached) {
+    // Cold Lambda instance fallback: materialize the real media file on demand
+    if (!j.title || j.title.startsWith("Extracting")) {
+      try {
+        const meta = await extractRealMetadata(j.sanitized_url, j.platform);
+        j.title = meta.title;
+      } catch {
+        j.title = `media_${id.slice(0, 6)}`;
+      }
+    }
+    const built = await downloadAndProcessRealMedia({
+      fileKey: j.fileKey,
+      url: j.sanitized_url,
+      platform: j.platform,
+      resolution: j.resolution,
+      format: j.format,
+      trimStart: j.trim_start,
+      trimEnd: j.trim_end,
+    });
+    cached = built.filePath;
+    updateStoredJob(id, {
+      status: "ready",
+      progress: 100,
+      file_size: built.fileSize,
+      download_url: `/api/v1/jobs/${id}/download`,
+    });
+  }
+
+  const ext = j.format || "mp4";
+  const safeStem = (j.title || id.slice(0, 6))
+    .replace(/[^A-Za-z0-9._ -]+/g, "")
+    .trim()
+    .replace(/\s+/g, "_")
+    .slice(0, 60) || id.slice(0, 6);
+
+  return {
+    filePath: cached,
+    filename: `${safeStem}.${ext}`,
+    format: ext,
+  };
 }
 
 export function cancelServerlessJob(id: string): { found: boolean; cancelled: boolean } {
   syncFromDisk();
   let j = store.get(id) ?? null;
   if (!j) {
-    j = decodeJobFromId(id);
-    if (j) store.set(id, j);
+    const token = decodeTokenFromId(id);
+    if (token) {
+      j = reconstructJobFromToken(id, token);
+      store.set(id, j);
+    }
   }
   if (!j) return { found: false, cancelled: false };
-  const current = materialize(j);
-  if (["ready", "failed", "cancelled"].includes(current.status)) {
+  if (["ready", "failed", "cancelled"].includes(j.status)) {
     return { found: true, cancelled: false };
   }
   j.cancelledFlag = true;
@@ -404,32 +536,4 @@ export function cancelServerlessJob(id: string): { found: boolean; cancelled: bo
   j.updated_at = new Date().toISOString();
   syncToDisk();
   return { found: true, cancelled: true };
-}
-
-export function buildPlayableWavBytes(durationSec = 2): Buffer {
-  const sampleRate = 22050;
-  const numSamples = sampleRate * durationSec;
-  const dataSize = numSamples * 2;
-  const buf = Buffer.alloc(44 + dataSize);
-  buf.write("RIFF", 0);
-  buf.writeUInt32LE(36 + dataSize, 4);
-  buf.write("WAVE", 8);
-  buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16);
-  buf.writeUInt16LE(1, 20);
-  buf.writeUInt16LE(1, 22);
-  buf.writeUInt32LE(sampleRate, 24);
-  buf.writeUInt32LE(sampleRate * 2, 28);
-  buf.writeUInt16LE(2, 32);
-  buf.writeUInt16LE(16, 34);
-  buf.write("data", 36);
-  buf.writeUInt32LE(dataSize, 40);
-  for (let i = 0; i < numSamples; i++) {
-    const t = i / sampleRate;
-    const env = Math.min(1, i / 1200) * Math.max(0, 1 - (i / numSamples) * 0.75);
-    const freq = t < durationSec / 2 ? 440 : 554.37;
-    const sample = Math.round(12000 * env * Math.sin(2 * Math.PI * freq * t));
-    buf.writeInt16LE(sample, 44 + i * 2);
-  }
-  return buf;
 }

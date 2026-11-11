@@ -1,17 +1,18 @@
 /**
- * Module A (client mirror): URL Sanitization & Link Sandbox.
- * Mirrors backend/app/sanitizer.py for instant UI validation.
+ * Module A (client & serverless): URL Sanitization & Link Sandbox.
+ * Mirrors backend/app/sanitizer.py for instant UI & API validation.
  */
 
 const TRACKING_PARAMS = new Set([
   "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
-  "igsh", "si", "fbclid", "t", "ref_src", "feature", "is_from_webapp", "sender_device",
+  "igsh", "si", "fbclid", "ref_src", "feature", "is_from_webapp", "sender_device",
   "ref", "ref_url", "gclid", "msclkid", "mc_cid", "mc_eid", "yclid", "vero_id",
   "vero_conv", "s", "sc", "sp", "shem", "share", "sharer", "mkt_tok",
+  "pp", "start_radio", "rv", "ab_channel",
 ]);
 
 const WHITELIST = [
-  /^(?:www\.|m\.)?youtube\.com$/i,
+  /^(?:www\.|m\.|music\.)?youtube\.com$/i,
   /^(?:www\.)?youtu\.be$/i,
   /^(?:www\.|m\.|vm\.|vt\.)?tiktok\.com$/i,
   /^(?:www\.)?instagram\.com$/i,
@@ -21,9 +22,9 @@ const WHITELIST = [
   /^(?:www\.)?redd\.it$/i,
   /^(?:www\.)?pinterest\.com$/i,
   /^(?:www\.)?pin\.it$/i,
-  /^(?:www\.)?vimeo\.com$/i,
-  /^(?:www\.|clips\.)?twitch\.tv$/i,
-  /^(?:www\.|m\.|fb\.)?facebook\.com$/i,
+  /^(?:www\.|player\.)?vimeo\.com$/i,
+  /^(?:www\.|clips\.|m\.)?twitch\.tv$/i,
+  /^(?:www\.|m\.|fb\.|web\.)?facebook\.com$/i,
   /^(?:www\.)?fb\.watch$/i,
   /^(?:www\.)?linkedin\.com$/i,
 ];
@@ -47,12 +48,46 @@ function isPrivateIp(rawHost: string): boolean {
   return false;
 }
 
+export function extractYoutubeVideoId(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase().replace(/^(www\.|m\.|music\.)/, "");
+    if (host === "youtu.be") {
+      const id = u.pathname.split("/").filter(Boolean)[0];
+      return id && /^[\w-]{11}$/.test(id) ? id : null;
+    }
+    if (host === "youtube.com") {
+      const v = u.searchParams.get("v");
+      if (v && /^[\w-]{11}$/.test(v)) return v;
+      const parts = u.pathname.split("/").filter(Boolean);
+      if (parts.length >= 2 && ["shorts", "embed", "live", "v"].includes(parts[0])) {
+        const id = parts[1];
+        return /^[\w-]{11}$/.test(id) ? id : null;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 export function stripTrackingParams(raw: string): string {
   try {
     const u = new URL(raw);
+    const ytId = extractYoutubeVideoId(raw);
     for (const key of Array.from(u.searchParams.keys())) {
       const lower = key.toLowerCase();
       if (TRACKING_PARAMS.has(lower) || lower.startsWith("utm_")) {
+        u.searchParams.delete(key);
+        continue;
+      }
+      // Strip 't' tracking param on X/TikTok (keep on YouTube if user didn't pass list, or strip general tracking 't')
+      if (lower === "t" && !ytId) {
+        u.searchParams.delete(key);
+        continue;
+      }
+      // When a specific YouTube video ID is in the URL (e.g. youtu.be/ID?list=RD...), strip playlist/mix params so single-video extraction targets that video
+      if (ytId && (lower === "list" || lower === "index" || lower === "t")) {
         u.searchParams.delete(key);
       }
     }
@@ -67,7 +102,7 @@ export function detectPlatform(host: string): string {
   let changed = true;
   while (changed) {
     changed = false;
-    for (const prefix of ["www.", "m.", "mobile.", "old.", "clips.", "fb."]) {
+    for (const prefix of ["www.", "m.", "music.", "mobile.", "old.", "clips.", "fb.", "web.", "player."]) {
       if (h.startsWith(prefix)) {
         h = h.slice(prefix.length);
         changed = true;

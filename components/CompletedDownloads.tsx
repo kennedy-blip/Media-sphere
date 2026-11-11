@@ -7,6 +7,20 @@ import {
 import { api, formatBytes, formatDuration } from "@/lib/api";
 import { useStore } from "@/lib/store";
 
+function shortId(id: string) {
+  return id.replace(/^ms_/, "").slice(0, 8);
+}
+
+function safeFileStem(title: string, fallback: string) {
+  return (
+    title
+      .replace(/[^A-Za-z0-9._ -]+/g, "")
+      .trim()
+      .replace(/\s+/g, "_")
+      .slice(0, 60) || fallback
+  );
+}
+
 export default function CompletedDownloads() {
   const { jobs } = useStore();
   const [openId, setOpenId] = useState<string | null>(null);
@@ -34,7 +48,7 @@ export default function CompletedDownloads() {
 
       {done.length === 0 && (
         <div className="rounded-2xl border border-dashed border-white/10 bg-panel p-10 text-center text-sm text-slate-400">
-          Nothing here yet. Finished jobs will appear as cards with players and export actions.
+          Nothing here yet. Finished jobs will appear as cards with live media players and export actions.
         </div>
       )}
 
@@ -45,12 +59,18 @@ export default function CompletedDownloads() {
           const inlineUrl = api.downloadUrl(job.id, false);
           const saveUrl = api.downloadUrl(job.id, true);
           const hasMediaErr = Boolean(mediaErrors[job.id]);
+          const stem = safeFileStem(job.title, shortId(job.id));
 
           return (
             <article key={job.id} className="overflow-hidden rounded-2xl border border-white/10 bg-panel">
               {job.thumbnail ? (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={job.thumbnail} alt={job.title} className="h-36 w-full object-cover" />
+                <img
+                  src={job.thumbnail}
+                  alt={job.title}
+                  referrerPolicy="no-referrer"
+                  className="h-36 w-full object-cover bg-ink"
+                />
               ) : (
                 <div className="flex h-36 w-full items-center justify-center bg-ink text-slate-500">
                   {isAudio ? <FileAudio className="w-10 h-10" /> : <FileVideo className="w-10 h-10" />}
@@ -59,9 +79,10 @@ export default function CompletedDownloads() {
               <div className="p-4 space-y-3">
                 <div className="flex items-start justify-between gap-2">
                   <h3 className="text-sm font-semibold text-white leading-snug">{job.title}</h3>
-                  <span className="shrink-0 font-mono text-[11px] text-slate-500">#{job.id.slice(0, 6)}</span>
+                  <span className="shrink-0 font-mono text-[11px] text-slate-500">#{shortId(job.id)}</span>
                 </div>
                 <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-400">
+                  {job.creator && <span className="text-slate-200">{job.creator}</span>}
                   <span className="capitalize">{job.platform}</span>
                   <span>{job.resolution} · {job.format.toUpperCase()}</span>
                   <span>{formatDuration(job.duration)}</span>
@@ -73,7 +94,7 @@ export default function CompletedDownloads() {
                   )}
                 </div>
 
-                {/* HTML5 preview with clean fallback when offline/placeholder container is used */}
+                {/* Real HTML5 media player */}
                 {job.download_url && !hasMediaErr && (
                   isAudio ? (
                     <audio
@@ -89,7 +110,7 @@ export default function CompletedDownloads() {
                       poster={job.thumbnail ?? undefined}
                       preload="metadata"
                       onError={() => setMediaErrors((m) => ({ ...m, [job.id]: true }))}
-                      className="w-full rounded-lg bg-ink max-h-48"
+                      className="w-full rounded-lg bg-ink max-h-52"
                     />
                   )
                 )}
@@ -102,7 +123,7 @@ export default function CompletedDownloads() {
                   </div>
                 )}
 
-                {/* AI transcript drawer */}
+                {/* AI transcript & summary drawer */}
                 {(job.transcript || job.summary) && (
                   <div className="rounded-xl border border-white/5 bg-ink">
                     <button
@@ -111,7 +132,7 @@ export default function CompletedDownloads() {
                       className="flex w-full items-center justify-between px-3 py-2 text-xs font-semibold text-slate-200"
                     >
                       <span className="inline-flex items-center gap-1.5">
-                        <Sparkles className="w-3.5 h-3.5 text-accent" /> AI transcript &amp; summary
+                        <Sparkles className="w-3.5 h-3.5 text-accent" /> Transcript &amp; AI summary
                       </span>
                       {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                     </button>
@@ -135,7 +156,7 @@ export default function CompletedDownloads() {
                 <div className="flex flex-wrap gap-2">
                   <a
                     href={saveUrl}
-                    download={`${job.id}.${job.format}`}
+                    download={`${stem}.${job.format}`}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-white hover:bg-accent/90 transition"
                   >
                     <Download className="w-3.5 h-3.5" /> Save File
@@ -174,7 +195,7 @@ export default function CompletedDownloads() {
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement("a");
                         a.href = url;
-                        a.download = `${job.id}.srt`;
+                        a.download = `${stem}.srt`;
                         a.click();
                         URL.revokeObjectURL(url);
                       }}

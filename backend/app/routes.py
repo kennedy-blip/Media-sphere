@@ -19,12 +19,12 @@ ws_router = APIRouter()
 
 @router.get("/health")
 def health():
-    return {"status": "ok", "service": "mediasphere-api", "version": "1.0.0"}
+    return {"status": "ok", "service": "mediasphere-api", "version": "2.0.0"}
 
 
 @router.post("/extract")
 def extract(req: ExtractRequest):
-    """Validate + sanitize URLs and return consolidated preview cards (Step 2)."""
+    """Validate + sanitize URLs and return real metadata preview cards."""
     previews = []
     for raw in req.urls:
         v = validate_url(raw)
@@ -37,11 +37,20 @@ def extract(req: ExtractRequest):
                 "tags": [], "duration": None, "formats": [],
             })
             continue
-        meta = extract_metadata(v["sanitized_url"], v["platform"])
-        previews.append({
-            "url": raw, "sanitized_url": v["sanitized_url"], "platform": v["platform"],
-            "valid": True, "error": None, **meta,
-        })
+        try:
+            meta = extract_metadata(v["sanitized_url"], v["platform"])
+            previews.append({
+                "url": raw, "sanitized_url": v["sanitized_url"], "platform": v["platform"],
+                "valid": True, "error": None, **meta,
+            })
+        except Exception as exc:
+            previews.append({
+                "url": raw, "sanitized_url": v["sanitized_url"], "platform": v["platform"],
+                "valid": False, "error": str(exc),
+                "title": None, "description": None, "creator": None, "avatar": None,
+                "thumbnail": None, "views": None, "likes": None, "upload_date": None,
+                "tags": [], "duration": None, "formats": [],
+            })
     return {
         "previews": previews,
         "count": len(previews),
@@ -124,7 +133,7 @@ def download_job(job_id: str, download: bool = Query(default=False)):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File expired or missing (15-min TTL)")
     ext = job["format"]
-    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", job["title"])[:40].strip("_") or job_id
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", job["title"])[:60].strip("_") or job_id
     filename = f"{safe_stem}.{ext}"
     mime = media_type_for(ext)
     disposition = "attachment" if download else "inline"
@@ -150,7 +159,6 @@ def get_transcript(job_id: str):
 
 @ws_router.websocket("/ws/queue")
 async def ws_queue(ws: WebSocket):
-    """Real-time progress: pushes job snapshots immediately + 200ms tick / 2s heartbeat."""
     await ws.accept()
     sub = job_store.subscribe()
     loop, queue = sub

@@ -2,7 +2,7 @@
 import { useMemo, useState } from "react";
 import {
   ClipboardPaste, Link2, ShieldCheck, ShieldAlert, Sparkles, Scissors,
-  FileVideo, FileAudio, Layers, Loader2, Plus, X, CheckCircle2, AlertCircle, Wand2,
+  FileVideo, FileAudio, Layers, Loader2, Plus, X, CheckCircle2, AlertCircle, Wand2, ThumbsUp, Calendar,
 } from "lucide-react";
 import { api, formatCount, formatDuration, validateTrimRange, type Preview } from "@/lib/api";
 import { validateUrl, parseBatchInput } from "@/lib/sanitizer";
@@ -12,9 +12,9 @@ const RESOLUTIONS = ["2160p", "1080p", "720p", "480p", "360p", "best", "audio"];
 const FORMATS = ["mp4", "webm", "mp3", "wav"] as const;
 
 const SAMPLE_URLS = [
-  "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=shared&utm_source=twitter",
-  "https://www.tiktok.com/@techbrand/video/7345678901234?is_from_webapp=1&sender_device=pc",
-  "https://www.instagram.com/reel/C3xY9z0A1bC/?igsh=MZRlODBiNWFlZA==",
+  "https://youtu.be/c8zq4kAn_O0?list=RDc8zq4kAn_O0",
+  "https://www.youtube.com/watch?v=aqz-KE-bpKQ&utm_source=twitter",
+  "https://vimeo.com/76979871",
 ].join("\n");
 
 const PLATFORM_COLORS: Record<string, string> = {
@@ -40,7 +40,7 @@ interface CardSelection {
 }
 
 const DEFAULT_SELECTION: CardSelection = {
-  resolution: "1080p",
+  resolution: "720p",
   format: "mp4",
   trimStart: "",
   trimEnd: "",
@@ -91,7 +91,14 @@ export default function ExtractionWorkspace() {
       setPreviews(data.previews);
       const init: Record<string, CardSelection> = {};
       data.previews.forEach((p) => {
-        init[p.sanitized_url] = { ...DEFAULT_SELECTION };
+        const availableRes = p.formats?.map((f) => f.resolution).filter(Boolean) ?? [];
+        const preferred =
+          availableRes.includes("720p")
+            ? "720p"
+            : availableRes.includes("1080p")
+              ? "1080p"
+              : availableRes[0] || "720p";
+        init[p.sanitized_url] = { ...DEFAULT_SELECTION, resolution: preferred };
       });
       setSelections(init);
     } catch (e) {
@@ -187,16 +194,16 @@ export default function ExtractionWorkspace() {
               onClick={loadDemoBatch}
               className="inline-flex items-center gap-1.5 text-xs text-accent hover:text-accent/80 transition"
             >
-              <Wand2 className="w-3.5 h-3.5" /> Load 3-platform sample
+              <Wand2 className="w-3.5 h-3.5" /> Load live sample URLs
             </button>
-            <span className="text-xs text-slate-400">Tracking params auto-stripped · SSRF sandbox active</span>
+            <span className="text-xs text-slate-400">Tracking &amp; Mix params auto-stripped · SSRF sandbox active</span>
           </div>
         </div>
         <div className="flex flex-col sm:flex-row gap-2">
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={"https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=shared\nhttps://www.tiktok.com/@techbrand/video/7345678901234?is_from_webapp=1\nhttps://www.instagram.com/reel/C3xY9z0A1bC/?igsh=MZRlODBiNWFlZA=="}
+            placeholder={"https://youtu.be/c8zq4kAn_O0?list=RDc8zq4kAn_O0\nhttps://www.tiktok.com/@creator/video/...\nhttps://vimeo.com/76979871"}
             rows={4}
             className="flex-1 rounded-xl bg-ink border border-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-accent/60 resize-y"
           />
@@ -232,7 +239,7 @@ export default function ExtractionWorkspace() {
                 title={v.valid ? v.sanitizedUrl ?? "" : v.error ?? ""}
               >
                 {v.valid ? <ShieldCheck className="w-3.5 h-3.5" /> : <ShieldAlert className="w-3.5 h-3.5" />}
-                {v.platform ?? "invalid"} {v.valid ? "· clean" : `· ${v.error}`}
+                {v.platform ?? "invalid"} {v.valid ? `· ${v.sanitizedUrl}` : `· ${v.error}`}
               </span>
             ))}
           </div>
@@ -246,7 +253,7 @@ export default function ExtractionWorkspace() {
             className="inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40 transition"
           >
             {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Layers className="w-4 h-4" />}
-            Extract metadata
+            {loading ? "Extracting live metadata…" : "Extract metadata"}
           </button>
           <span className="text-xs text-slate-400">
             {urls.length} URL{urls.length !== 1 ? "s" : ""} · {validCount} valid · max 20 per batch
@@ -264,7 +271,7 @@ export default function ExtractionWorkspace() {
         <div>
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-white">
-              Preview cards ({previews.filter((p) => p.valid).length}/{previews.length} valid)
+              Live preview cards ({previews.filter((p) => p.valid).length}/{previews.length} resolved)
             </h3>
             {previews.some((p) => p.valid) && (
               <button
@@ -286,25 +293,48 @@ export default function ExtractionWorkspace() {
                 <article key={`${p.sanitized_url}-${i}`} className="overflow-hidden rounded-2xl border border-white/10 bg-panel">
                   {p.thumbnail ? (
                     // eslint-disable-next-line @next/next/no-img-element
-                    <img src={p.thumbnail} alt={p.title ?? "thumbnail"} className="h-40 w-full object-cover" />
+                    <img
+                      src={p.thumbnail}
+                      alt={p.title ?? "thumbnail"}
+                      referrerPolicy="no-referrer"
+                      className="h-44 w-full object-cover bg-ink"
+                    />
                   ) : (
-                    <div className="flex h-40 w-full items-center justify-center bg-ink text-slate-500 text-sm">
-                      {p.valid ? "No thumbnail" : "Invalid URL"}
+                    <div className="flex h-44 w-full items-center justify-center bg-ink text-slate-500 text-sm">
+                      {p.valid ? "No thumbnail" : "Extraction failed"}
                     </div>
                   )}
                   <div className="p-4 space-y-3">
                     <div className="flex items-start justify-between gap-2">
-                      <h4 className="text-sm font-semibold text-white leading-snug">{p.title ?? "Blocked / Invalid URL"}</h4>
+                      <h4 className="text-sm font-semibold text-white leading-snug">{p.title ?? "Unable to extract URL"}</h4>
                       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] capitalize ${PLATFORM_COLORS[p.platform] ?? "bg-white/5 text-slate-300 border-white/10"}`}>
                         {p.platform}
                       </span>
                     </div>
-                    <p className="text-xs text-slate-400 line-clamp-2">{p.description ?? p.error ?? ""}</p>
+                    {p.description && (
+                      <p className="text-xs text-slate-400 line-clamp-2">{p.description}</p>
+                    )}
                     {p.valid && (
-                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
-                        <span>{p.creator ?? "—"}</span>
-                        <span>{formatCount(p.views)} views</span>
-                        <span>{formatDuration(p.duration)}</span>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
+                        <span className="inline-flex items-center gap-1.5 font-medium text-slate-200">
+                          {p.avatar && (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={p.avatar} alt="" referrerPolicy="no-referrer" className="h-4 w-4 rounded-full object-cover" />
+                          )}
+                          {p.creator ?? "—"}
+                        </span>
+                        {p.views != null && <span>{formatCount(p.views)} views</span>}
+                        {p.likes != null && (
+                          <span className="inline-flex items-center gap-1">
+                            <ThumbsUp className="w-3 h-3" /> {formatCount(p.likes)}
+                          </span>
+                        )}
+                        {p.duration != null && <span>{formatDuration(p.duration)}</span>}
+                        {p.upload_date && (
+                          <span className="inline-flex items-center gap-1">
+                            <Calendar className="w-3 h-3" /> {p.upload_date}
+                          </span>
+                        )}
                       </div>
                     )}
                     <p className="truncate text-[11px] text-slate-500" title={p.sanitized_url}>{p.sanitized_url}</p>
@@ -343,7 +373,7 @@ export default function ExtractionWorkspace() {
                             <input
                               value={sel.trimStart}
                               onChange={(e) => updateSel(p.sanitized_url, { trimStart: e.target.value })}
-                              placeholder="01:15"
+                              placeholder="00:10"
                               className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
                             />
                           </label>
@@ -352,7 +382,7 @@ export default function ExtractionWorkspace() {
                             <input
                               value={sel.trimEnd}
                               onChange={(e) => updateSel(p.sanitized_url, { trimEnd: e.target.value })}
-                              placeholder="02:30"
+                              placeholder="00:45"
                               className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
                             />
                           </label>
@@ -386,13 +416,13 @@ export default function ExtractionWorkspace() {
                           disabled={dispatching || Boolean(trimErr)}
                           className="w-full rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40 transition"
                         >
-                          Extract &amp; process
+                          {dispatching ? "Dispatching…" : "Extract & process"}
                         </button>
                       </div>
                     )}
                     {!p.valid && (
-                      <div className="flex items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs text-red-300">
-                        <X className="w-3.5 h-3.5 shrink-0" /> {p.error}
+                      <div className="flex items-start gap-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs text-red-300">
+                        <X className="w-3.5 h-3.5 shrink-0 mt-0.5" /> <span>{p.error}</span>
                       </div>
                     )}
                   </div>
