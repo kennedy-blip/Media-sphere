@@ -12,6 +12,7 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import { chooseFormat, Quality } from "@distube/ytdl-core";
 import { getSharedYtdl, resolveDirectStreamUrls } from "./realExtractor";
 import { extractYoutubeVideoId } from "./sanitizer";
+import { isHlsManifestUrl } from "./youtubeProviders";
 
 const execFileAsync = promisify(execFile);
 
@@ -59,7 +60,8 @@ async function streamReadableToFile(
   readable: Readable,
   destPath: string,
   onProgress?: (p: ProgressCallbackPayload) => void,
-  progressRange: [number, number] = [25, 72]
+  progressRange: [number, number] = [28, 74],
+  totalBytes?: number | null
 ): Promise<void> {
   const started = Date.now();
   let bytes = 0;
@@ -71,16 +73,36 @@ async function streamReadableToFile(
       lastReport = now;
       const elapsedSec = Math.max(0.1, (now - started) / 1000);
       const speedMbps = Number((bytes / (1024 * 1024) / elapsedSec).toFixed(1));
-      const pct = Math.min(
-        progressRange[1],
-        progressRange[0] + Math.log1p(bytes / (512 * 1024)) * 11
-      );
-      onProgress({ progress: Math.round(pct), speedMbps, etaSeconds: 3 });
+      const pct =
+        totalBytes && totalBytes > 0
+          ? Math.min(progressRange[1], progressRange[0] + (bytes / totalBytes) * (progressRange[1] - progressRange[0]))
+          : Math.min(progressRange[1], progressRange[0] + Math.log1p(bytes / (512 * 1024)) * 11);
+      const eta =
+        totalBytes && totalBytes > bytes && speedMbps > 0
+          ? Math.max(1, Math.round((totalBytes - bytes) / (1024 * 1024) / speedMbps))
+          : 3;
+      onProgress({ progress: Math.round(pct), speedMbps, etaSeconds: eta });
     }
   });
   await pipeline(readable, fs.createWriteStream(destPath));
   if (!fs.existsSync(destPath) || fs.statSync(destPath).size < 256) {
     throw new Error("Downloaded stream was empty");
+  }
+
+  // Guard against HTML/JSON error responses saved to disk
+  const fd = fs.openSync(destPath, "r");
+  const head = Buffer.alloc(256);
+  const readBytes = fs.readSync(fd, head, 0, 256, 0);
+  fs.closeSync(fd);
+  const sample = head.subarray(0, readBytes).toString("latin1").trimStart().toLowerCase();
+  if (
+    sample.startsWith("<!doctype") ||
+    sample.startsWith("<html") ||
+    sample.startsWith('{"error') ||
+    sample.startsWith('{"status":false')
+  ) {
+    safeUnlink(destPath);
+    throw new Error("Upstream CDN returned an error document instead of media bytes");
   }
 }
 
@@ -89,7 +111,7 @@ async function downloadHttpUrlToFile(
   destPath: string,
   headers?: Record<string, string>,
   onProgress?: (p: ProgressCallbackPayload) => void,
-  progressRange: [number, number] = [25, 72]
+  progressRange: [number, number] = [28, 74]
 ): Promise<void> {
   const res = await fetch(streamUrl, {
     headers: {
@@ -98,168 +120,130 @@ async function downloadHttpUrlToFile(
       ...(headers || {}),
     },
     redirect: "follow",
-    signal: AbortSignal.timeout(45000),
+    signal: AbortSignal.timeout(90000),
   });
   if (!res.ok || !res.body) {
     throw new Error(`Media stream HTTP ${res.status}`);
   }
+  const totalLen = Number(res.headers.get("content-length") || 0) || null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const nodeReadable = Readable.fromWeb(res.body as any);
-  await streamReadableToFile(nodeReadable, destPath, onProgress, progressRange);
+  await streamReadableToFile(nodeReadable, destPath, onProgress, progressRange, totalLen);
 }
 
-async function downloadYoutubeRaw(
+async function downloadYoutubeYtdlFallback(
   url: string,
   filePrefix: string,
   resolution: string,
   format: string,
   onProgress?: (p: ProgressCallbackPayload) => void
-): Promise<{ videoPath?: string; audioPath?: string }> {
+): Promise<{ videoInput?: string; audioInput?: string }> {
   const videoId = extractYoutubeVideoId(url);
   if (!videoId) throw new Error("Invalid YouTube video ID");
 
   const wantAudioOnly = resolution === "audio" || format === "mp3" || format === "wav";
   const targetHeight = resolution === "best" ? 2160 : parseInt(resolution.replace(/\D/g, ""), 10) || 1080;
 
-  // Attempt 1: @distube/ytdl-core v5 (VisionOS / WebEmbedded / Tv / Mweb / WebMusic + SABR + PO Token)
-  try {
-    const ytdl = getSharedYtdl();
-    const info = await ytdl.getInfo(videoId, { signal: AbortSignal.timeout(14000) });
+  const ytdl = getSharedYtdl();
+  const info = await ytdl.getInfo(videoId, { signal: AbortSignal.timeout(12000) });
 
-    if (wantAudioOnly) {
-      const audioFmt = chooseFormat(info.formats, {
-        quality: Quality.HighestAudio,
-        filter: [{ hasAudio: true, hasVideo: false }, { hasAudio: true }],
-      });
-      const audioDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_aud.${audioFmt.container || "m4a"}`);
-      const started = Date.now();
-      let lastReport = 0;
-      const stream = ytdl.download(info, {
-        format: audioFmt,
-        signal: AbortSignal.timeout(45000),
-        onProgress: (ev) => {
-          const now = Date.now();
-          if (onProgress && now - lastReport >= 350) {
-            lastReport = now;
-            const sec = Math.max(0.1, (now - started) / 1000);
-            const speed = Number((ev.downloaded / (1024 * 1024) / sec).toFixed(1));
-            const ratio = ev.total ? ev.downloaded / ev.total : 0.5;
-            onProgress({
-              progress: Math.round(25 + ratio * 48),
-              speedMbps: speed,
-              etaSeconds: ev.total && speed > 0 ? Math.max(1, Math.round((ev.total - ev.downloaded) / (1024 * 1024) / speed)) : 2,
-            });
-          }
-        },
-      });
-      await pipeline(stream, fs.createWriteStream(audioDest));
-      if (fs.existsSync(audioDest) && fs.statSync(audioDest).size > 512) {
-        return { audioPath: audioDest };
-      }
-    } else {
-      // Check if a muxed format satisfies requested height (e.g. 360p/720p), else download adaptive video + audio
-      const muxedCandidates = info.formats
-        .filter((f) => f.hasVideo && f.hasAudio && !f.isHLS && (f.height || 360) <= targetHeight)
-        .sort((a, b) => (b.height || 0) - (a.height || 0));
-
-      const adaptiveVideoCandidates = info.formats
-        .filter((f) => f.hasVideo && !f.isHLS && (f.height || 360) <= targetHeight)
-        .sort((a, b) => (b.height || 0) - (a.height || 0));
-
-      const bestMuxed = muxedCandidates[0];
-      const bestAdaptive = adaptiveVideoCandidates[0];
-
-      if (bestMuxed && (!bestAdaptive || (bestMuxed.height || 0) >= Math.min(targetHeight, bestAdaptive.height || 0))) {
-        const vidDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_mux.${bestMuxed.container || "mp4"}`);
-        const stream = ytdl.download(info, {
-          format: bestMuxed,
-          signal: AbortSignal.timeout(45000),
-        });
-        await streamReadableToFile(stream, vidDest, onProgress, [25, 72]);
-        return { videoPath: vidDest };
-      }
-
-      if (bestAdaptive) {
-        const vidDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_vid.${bestAdaptive.container || "mp4"}`);
-        const audioFmt = chooseFormat(info.formats, {
-          quality: Quality.HighestAudio,
-          filter: [{ hasAudio: true, hasVideo: false }, { hasAudio: true }],
-        });
-        const audDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_aud.${audioFmt.container || "m4a"}`);
-
-        await Promise.all([
-          streamReadableToFile(
-            ytdl.download(info, { format: bestAdaptive, signal: AbortSignal.timeout(45000) }),
-            vidDest,
-            onProgress,
-            [25, 65]
-          ),
-          pipeline(
-            ytdl.download(info, { format: audioFmt, signal: AbortSignal.timeout(45000) }),
-            fs.createWriteStream(audDest)
-          ),
-        ]);
-        return { videoPath: vidDest, audioPath: audDest };
-      }
-    }
-  } catch {
-    /* Fall through to Piped / Invidious stream proxy */
+  if (wantAudioOnly) {
+    const audioFmt = chooseFormat(info.formats, {
+      quality: Quality.HighestAudio,
+      filter: [{ hasAudio: true, hasVideo: false }, { hasAudio: true }],
+    });
+    const audioDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_aud.${audioFmt.container || "m4a"}`);
+    const stream = ytdl.download(info, {
+      format: audioFmt,
+      signal: AbortSignal.timeout(60000),
+    });
+    await streamReadableToFile(stream, audioDest, onProgress, [28, 74], audioFmt.contentLength);
+    return { audioInput: audioDest };
   }
 
-  // Attempt 2: Piped / Invidious stream URLs
-  const direct = await resolveDirectStreamUrls(url, "youtube", resolution, format);
-  if (wantAudioOnly && (direct.audioUrl || direct.videoUrl)) {
-    const audDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_aud.m4a`);
-    await downloadHttpUrlToFile((direct.audioUrl || direct.videoUrl)!, audDest, direct.headers, onProgress);
-    return { audioPath: audDest };
-  }
-  if (direct.videoUrl) {
-    const vidDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_vid.mp4`);
-    await downloadHttpUrlToFile(direct.videoUrl, vidDest, direct.headers, onProgress, [25, 65]);
-    let audDest: string | undefined;
-    if (direct.audioUrl) {
-      audDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_aud.m4a`);
-      try {
-        await downloadHttpUrlToFile(direct.audioUrl, audDest, direct.headers);
-      } catch {
-        audDest = undefined;
-      }
-    }
-    return { videoPath: vidDest, audioPath: audDest };
+  const muxedCandidates = info.formats
+    .filter((f) => f.hasVideo && f.hasAudio && !f.isHLS && (f.height || 360) <= targetHeight)
+    .sort((a, b) => (b.height || 0) - (a.height || 0));
+  if (muxedCandidates[0]) {
+    const vidDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_mux.${muxedCandidates[0].container || "mp4"}`);
+    const stream = ytdl.download(info, {
+      format: muxedCandidates[0],
+      signal: AbortSignal.timeout(60000),
+    });
+    await streamReadableToFile(stream, vidDest, onProgress, [28, 74], muxedCandidates[0].contentLength);
+    return { videoInput: vidDest };
   }
 
-  throw new Error("All YouTube stream resolvers failed or stream is geo/DRM restricted");
+  const adaptiveVideo = info.formats
+    .filter((f) => f.hasVideo && !f.isHLS && (f.height || 360) <= targetHeight)
+    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+  if (!adaptiveVideo) {
+    throw new Error("No downloadable video format returned by ytdl fallback");
+  }
+  const audioFmt = chooseFormat(info.formats, {
+    quality: Quality.HighestAudio,
+    filter: [{ hasAudio: true, hasVideo: false }, { hasAudio: true }],
+  });
+  const vidDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_vid.${adaptiveVideo.container || "mp4"}`);
+  const audDest = path.join(MEDIA_TMP_DIR, `${filePrefix}_aud.${audioFmt.container || "m4a"}`);
+
+  await Promise.all([
+    streamReadableToFile(
+      ytdl.download(info, { format: adaptiveVideo, signal: AbortSignal.timeout(60000) }),
+      vidDest,
+      onProgress,
+      [28, 68],
+      adaptiveVideo.contentLength
+    ),
+    streamReadableToFile(
+      ytdl.download(info, { format: audioFmt, signal: AbortSignal.timeout(60000) }),
+      audDest,
+      undefined,
+      [28, 68],
+      audioFmt.contentLength
+    ),
+  ]);
+  return { videoInput: vidDest, audioInput: audDest };
+}
+
+function formatFfmpegHeaderArg(headers?: Record<string, string>): string | null {
+  if (!headers || Object.keys(headers).length === 0) return null;
+  const lines = Object.entries(headers)
+    .filter(([k, v]) => k && v)
+    .map(([k, v]) => `${k}: ${v}\r\n`);
+  return lines.length > 0 ? lines.join("") : null;
 }
 
 async function runFfmpegProcess(params: {
-  videoPath?: string;
-  audioPath?: string;
+  videoInput?: string;
+  audioInput?: string;
+  inputHeaders?: Record<string, string>;
   outputPath: string;
   format: string;
   trimStart: string | null;
   trimEnd: string | null;
 }): Promise<void> {
   const ffmpeg = resolveFfmpegBin();
+  const headerBlock = formatFfmpegHeaderArg(params.inputHeaders);
+
+  const buildInputArgs = (input: string) => {
+    const out: string[] = [];
+    const isRemote = /^https?:\/\//i.test(input);
+    if (isRemote && headerBlock) {
+      out.push("-headers", headerBlock);
+    }
+    if (params.trimStart) out.push("-ss", params.trimStart);
+    if (params.trimEnd) out.push("-to", params.trimEnd);
+    out.push("-i", input);
+    return out;
+  };
+
   const args: string[] = ["-y"];
-
-  if (params.trimStart) {
-    args.push("-ss", params.trimStart);
+  if (params.videoInput) {
+    args.push(...buildInputArgs(params.videoInput));
   }
-  if (params.trimEnd) {
-    args.push("-to", params.trimEnd);
-  }
-
-  if (params.videoPath) {
-    args.push("-i", params.videoPath);
-  }
-  if (params.audioPath) {
-    if (params.trimStart && params.videoPath) {
-      args.push("-ss", params.trimStart);
-    }
-    if (params.trimEnd && params.videoPath) {
-      args.push("-to", params.trimEnd);
-    }
-    args.push("-i", params.audioPath);
+  if (params.audioInput) {
+    args.push(...buildInputArgs(params.audioInput));
   }
 
   if (params.format === "mp3") {
@@ -267,15 +251,20 @@ async function runFfmpegProcess(params: {
   } else if (params.format === "wav") {
     args.push("-vn", "-acodec", "pcm_s16le", "-ar", "44100");
   } else if (params.format === "webm") {
-    if (params.videoPath && params.audioPath) {
+    if (params.videoInput && params.audioInput) {
       args.push("-map", "0:v:0", "-map", "1:a:0?");
     }
     args.push("-c:v", "libvpx", "-b:v", "1M", "-c:a", "libvorbis", "-shortest");
   } else {
     // mp4: fast stream-copy when possible, fallback to ultrafast H.264 + AAC
-    if (params.videoPath && params.audioPath) {
+    if (params.videoInput && params.audioInput) {
       args.push("-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart");
-    } else if (!params.trimStart && !params.trimEnd && params.videoPath?.endsWith(".mp4")) {
+    } else if (
+      !params.trimStart &&
+      !params.trimEnd &&
+      params.videoInput &&
+      !/^https?:\/\//i.test(params.videoInput)
+    ) {
       args.push("-c", "copy", "-movflags", "+faststart");
     } else {
       args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-movflags", "+faststart");
@@ -285,28 +274,39 @@ async function runFfmpegProcess(params: {
   args.push(params.outputPath);
 
   try {
-    await execFileAsync(ffmpeg, args, { timeout: 55000, maxBuffer: 10 * 1024 * 1024 });
+    await execFileAsync(ffmpeg, args, { timeout: 110000, maxBuffer: 10 * 1024 * 1024 });
+    if (fs.existsSync(params.outputPath) && fs.statSync(params.outputPath).size > 512) {
+      return;
+    }
+    throw new Error("Initial FFmpeg pass produced empty output");
   } catch {
-    // Fallback transcode if stream-copy failed on container/codec mismatch
+    // Fallback full transcode if stream-copy failed on codec/container mismatch
     const fallbackArgs: string[] = ["-y"];
-    if (params.trimStart) fallbackArgs.push("-ss", params.trimStart);
-    if (params.trimEnd) fallbackArgs.push("-to", params.trimEnd);
-    if (params.videoPath) fallbackArgs.push("-i", params.videoPath);
-    if (params.audioPath) fallbackArgs.push("-i", params.audioPath);
+    if (params.videoInput) fallbackArgs.push(...buildInputArgs(params.videoInput));
+    if (params.audioInput) fallbackArgs.push(...buildInputArgs(params.audioInput));
     if (params.format === "mp3") {
       fallbackArgs.push("-vn", "-acodec", "libmp3lame", "-q:a", "2");
     } else if (params.format === "wav") {
-      fallbackArgs.push("-vn", "-acodec", "pcm_s16le");
+      fallbackArgs.push("-vn", "-acodec", "pcm_s16le", "-ar", "44100");
+    } else if (params.format === "webm") {
+      fallbackArgs.push("-c:v", "libvpx", "-b:v", "1M", "-c:a", "libvorbis", "-shortest");
     } else {
-      fallbackArgs.push("-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", "-movflags", "+faststart");
+      fallbackArgs.push(
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-shortest",
+        "-movflags", "+faststart"
+      );
     }
     fallbackArgs.push(params.outputPath);
-    await execFileAsync(ffmpeg, fallbackArgs, { timeout: 55000, maxBuffer: 10 * 1024 * 1024 });
+    await execFileAsync(ffmpeg, fallbackArgs, { timeout: 110000, maxBuffer: 10 * 1024 * 1024 });
   }
 }
 
 function safeUnlink(p: string | undefined) {
-  if (!p) return;
+  if (!p || /^https?:\/\//i.test(p)) return;
   try {
     if (fs.existsSync(p)) fs.unlinkSync(p);
   } catch {
@@ -332,57 +332,82 @@ export async function downloadAndProcessRealMedia(params: {
     return { filePath: outputPath, fileSize: fs.statSync(outputPath).size };
   }
 
-  let videoPath: string | undefined;
-  let audioPath: string | undefined;
+  let videoInput: string | undefined;
+  let audioInput: string | undefined;
+  let inputHeaders: Record<string, string> | undefined;
 
   try {
-    if (params.platform === "youtube") {
-      const dl = await downloadYoutubeRaw(
-        params.url,
-        params.fileKey,
-        params.resolution,
-        ext,
-        params.onProgress
-      );
-      videoPath = dl.videoPath;
-      audioPath = dl.audioPath;
-    } else {
+    params.onProgress?.({ progress: 26, speedMbps: 0, etaSeconds: 8 });
+    const wantAudioOnly = params.resolution === "audio" || ext === "mp3" || ext === "wav";
+
+    try {
       const direct = await resolveDirectStreamUrls(
         params.url,
         params.platform,
         params.resolution,
         ext
       );
-      const wantAudioOnly = params.resolution === "audio" || ext === "mp3" || ext === "wav";
-      if (wantAudioOnly && (direct.audioUrl || direct.videoUrl)) {
-        audioPath = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.mp4`);
-        await downloadHttpUrlToFile(
-          (direct.audioUrl || direct.videoUrl)!,
-          audioPath,
-          direct.headers,
-          params.onProgress
-        );
-      } else if (direct.videoUrl) {
-        videoPath = path.join(MEDIA_TMP_DIR, `${params.fileKey}_vid.mp4`);
-        await downloadHttpUrlToFile(direct.videoUrl, videoPath, direct.headers, params.onProgress, [25, 65]);
-        if (direct.audioUrl) {
-          audioPath = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.mp4`);
-          try {
-            await downloadHttpUrlToFile(direct.audioUrl, audioPath, direct.headers);
-          } catch {
-            audioPath = undefined;
+      inputHeaders = direct.headers;
+
+      const primaryStream = wantAudioOnly ? (direct.audioUrl || direct.videoUrl) : direct.videoUrl;
+      if (!primaryStream) {
+        throw new Error("Provider returned empty media URL");
+      }
+
+      if (direct.isHls || isHlsManifestUrl(primaryStream)) {
+        // Let bundled FFmpeg demux & trim HLS segments directly
+        params.onProgress?.({ progress: 52, speedMbps: 2.4, etaSeconds: 5 });
+        if (wantAudioOnly) {
+          audioInput = primaryStream;
+        } else {
+          videoInput = primaryStream;
+          if (direct.audioUrl && direct.audioUrl !== primaryStream) {
+            audioInput = direct.audioUrl;
           }
         }
+      } else if (wantAudioOnly) {
+        audioInput = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.media`);
+        await downloadHttpUrlToFile(primaryStream, audioInput, direct.headers, params.onProgress, [30, 74]);
       } else {
-        throw new Error("Could not resolve downloadable media stream URL");
+        videoInput = path.join(MEDIA_TMP_DIR, `${params.fileKey}_vid.mp4`);
+        await downloadHttpUrlToFile(primaryStream, videoInput, direct.headers, params.onProgress, [30, 68]);
+        if (direct.audioUrl) {
+          const audTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.m4a`);
+          try {
+            await downloadHttpUrlToFile(direct.audioUrl, audTmp, direct.headers, undefined, [68, 74]);
+            audioInput = audTmp;
+          } catch {
+            audioInput = undefined;
+          }
+        }
+      }
+    } catch (primaryErr) {
+      // Extra fallback for YouTube via @distube/ytdl-core if all relay providers failed
+      if (params.platform === "youtube") {
+        try {
+          const fb = await downloadYoutubeYtdlFallback(
+            params.url,
+            params.fileKey,
+            params.resolution,
+            ext,
+            params.onProgress
+          );
+          videoInput = fb.videoInput;
+          audioInput = fb.audioInput;
+        } catch {
+          throw primaryErr;
+        }
+      } else {
+        throw primaryErr;
       }
     }
 
-    params.onProgress?.({ progress: 76, speedMbps: 0, etaSeconds: 2 });
+    params.onProgress?.({ progress: 78, speedMbps: 0, etaSeconds: 2 });
 
     await runFfmpegProcess({
-      videoPath,
-      audioPath,
+      videoInput,
+      audioInput,
+      inputHeaders,
       outputPath,
       format: ext,
       trimStart: params.trimStart,
@@ -396,8 +421,8 @@ export async function downloadAndProcessRealMedia(params: {
     cleanupServerlessStorage();
     return { filePath: outputPath, fileSize: fs.statSync(outputPath).size };
   } finally {
-    safeUnlink(videoPath);
-    safeUnlink(audioPath);
+    safeUnlink(videoInput);
+    safeUnlink(audioInput);
   }
 }
 

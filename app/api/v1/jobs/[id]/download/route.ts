@@ -5,7 +5,7 @@ import { ensureDownloadableFile } from "@/lib/serverlessEngine";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 180;
 
 const MIME_MAP: Record<string, string> = {
   mp4: "video/mp4",

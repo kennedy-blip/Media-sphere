@@ -1,7 +1,7 @@
 /**
- * Real caption, .SRT subtitle, and extractive summarization engine.
- * Pulls authentic timed captions from YouTube/Piped/Invidious/VTT tracks,
- * applies optional [trim_start, trim_end] windowing, and computes a real extractive summary.
+ * Real caption, .SRT subtitle, synced lyric, and extractive summarization engine.
+ * Pulls authentic timed captions from YouTube/Piped/Invidious/VTT tracks + LRCLIB synced lyrics
+ * for music videos, applies optional [trim_start, trim_end] windowing, and computes a summary.
  */
 import { CaptionFormat } from "@distube/ytdl-core";
 import { getSubtitles } from "youtube-caption-extractor";
@@ -101,6 +101,77 @@ export function parseVttToCues(vtt: string): Cue[] {
   return cues;
 }
 
+export function parseLrcToCues(lrc: string): Cue[] {
+  const rawLines = lrc.replace(/\r\n/g, "\n").split("\n");
+  const timed: Array<{ start: number; text: string }> = [];
+  for (const line of rawLines) {
+    const m = line.match(/^\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)\]\s*(.*)$/);
+    if (!m) continue;
+    const start = parseInt(m[1], 10) * 60 + parseFloat(m[2]);
+    const text = m[3].trim();
+    if (text) {
+      timed.push({ start, text });
+    }
+  }
+  const cues: Cue[] = [];
+  for (let i = 0; i < timed.length; i++) {
+    const cur = timed[i];
+    const next = timed[i + 1];
+    const end = next ? Math.max(cur.start + 0.5, Math.min(next.start, cur.start + 6)) : cur.start + 4;
+    cues.push({ start: cur.start, end, text: cur.text });
+  }
+  return cues;
+}
+
+async function fetchSyncedLyricsFallback(meta: ExtractedMetadata): Promise<{ cues: Cue[]; plain: string | null }> {
+  const cleanTitle = (meta.title || "")
+    .replace(/[\(\[][^\)\]]*(?:official|video|audio|lyric|visualizer|hd|4k|hq|mv|remaster)[^\)\]]*[\)\]]/gi, "")
+    .replace(/\s+\|\s+.*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleanTitle || cleanTitle.length < 3) return { cues: [], plain: null };
+
+  try {
+    const res = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(cleanTitle)}`, {
+      headers: { "User-Agent": "MediaSphere/2.0 (https://media-sphere-ten.vercel.app)" },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return { cues: [], plain: null };
+    const items = (await res.json()) as Array<{
+      trackName?: string;
+      artistName?: string;
+      duration?: number;
+      syncedLyrics?: string | null;
+      plainLyrics?: string | null;
+    }>;
+    if (!Array.isArray(items) || items.length === 0) return { cues: [], plain: null };
+
+    // Prefer a result matching approximate duration (within 25s) with syncedLyrics
+    const targetDur = meta.duration;
+    const best =
+      items.find(
+        (it) =>
+          it.syncedLyrics &&
+          (!targetDur || !it.duration || Math.abs(it.duration - targetDur) <= 30)
+      ) ||
+      items.find((it) => it.syncedLyrics) ||
+      items[0];
+
+    if (best?.syncedLyrics) {
+      const cues = parseLrcToCues(best.syncedLyrics);
+      if (cues.length > 0) {
+        return { cues, plain: cues.map((c) => c.text).join(" ") };
+      }
+    }
+    if (best?.plainLyrics) {
+      return { cues: [], plain: best.plainLyrics.replace(/\s+/g, " ").trim() };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { cues: [], plain: null };
+}
+
 const STOPWORDS = new Set([
   "the", "and", "for", "that", "this", "with", "you", "your", "are", "was", "were",
   "from", "have", "has", "had", "not", "but", "what", "all", "can", "will", "just",
@@ -139,7 +210,6 @@ export function summarizeRealText(transcript: string | null, meta: ExtractedMeta
     return `${meta.title} (${meta.creator}): ${source.slice(0, 420)}`;
   }
 
-  // Grounded metadata summary when the video has no spoken/lyric caption track (e.g. uncaptioned music video)
   const descFirst = (meta.description || "")
     .split(/\n+/)
     .map((l) => l.trim())
@@ -154,34 +224,7 @@ export function summarizeRealText(transcript: string | null, meta: ExtractedMeta
 }
 
 async function fetchYoutubeCues(videoId: string): Promise<Cue[]> {
-  // 1. Official InnerTube timedtext via @distube/ytdl-core
-  try {
-    const ytdl = getSharedYtdl();
-    const rawJson3 = await ytdl.getCaptions(videoId, {
-      format: CaptionFormat.Json3,
-      signal: AbortSignal.timeout(8000),
-    });
-    const cues = parseJson3Captions(rawJson3);
-    if (cues.length > 0) return cues;
-  } catch {
-    /* try fallback */
-  }
-
-  // 2. youtube-caption-extractor fallback
-  try {
-    const subs = await getSubtitles({ videoID: videoId, lang: "en" });
-    if (subs && subs.length > 0) {
-      return subs.map((s) => {
-        const start = parseFloat(s.start) || 0;
-        const dur = parseFloat(s.dur) || 2.5;
-        return { start, end: start + dur, text: s.text.replace(/\s+/g, " ").trim() };
-      }).filter((c) => c.text);
-    }
-  } catch {
-    /* try Piped/Invidious */
-  }
-
-  // 3. Piped subtitles VTT
+  // 1. Live Piped VTT subtitles (works cleanly from serverless / datacenter IPs)
   try {
     const piped = await fetchPipedStreams(videoId);
     const subTrack =
@@ -196,6 +239,38 @@ async function fetchYoutubeCues(videoId: string): Promise<Cue[]> {
       }
     }
   } catch {
+    /* try next */
+  }
+
+  // 2. youtube-caption-extractor
+  try {
+    const subs = await Promise.race([
+      getSubtitles({ videoID: videoId, lang: "en" }),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
+    ]);
+    if (subs && subs.length > 0) {
+      return subs
+        .map((s) => {
+          const start = parseFloat(s.start) || 0;
+          const dur = parseFloat(s.dur) || 2.5;
+          return { start, end: start + dur, text: s.text.replace(/\s+/g, " ").trim() };
+        })
+        .filter((c) => c.text);
+    }
+  } catch {
+    /* try next */
+  }
+
+  // 3. Official InnerTube timedtext via @distube/ytdl-core
+  try {
+    const ytdl = getSharedYtdl();
+    const rawJson3 = await ytdl.getCaptions(videoId, {
+      format: CaptionFormat.Json3,
+      signal: AbortSignal.timeout(5000),
+    });
+    const cues = parseJson3Captions(rawJson3);
+    if (cues.length > 0) return cues;
+  } catch {
     /* try Invidious */
   }
 
@@ -205,7 +280,7 @@ async function fetchYoutubeCues(videoId: string): Promise<Cue[]> {
     const cap = inv?.data.captions?.[0];
     if (inv && cap?.url) {
       const capUrl = cap.url.startsWith("http") ? cap.url : `${inv.base}${cap.url}`;
-      const res = await fetch(capUrl, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(capUrl, { signal: AbortSignal.timeout(4500) });
       if (res.ok) {
         const cues = parseVttToCues(await res.text());
         if (cues.length > 0) return cues;
@@ -232,10 +307,22 @@ export async function extractRealTranscriptAndSummary(params: {
   }
 
   let cues: Cue[] = [];
+  let plainFallback: string | null = null;
+
   if (params.platform === "youtube") {
     const videoId = extractYoutubeVideoId(params.url);
     if (videoId) {
       cues = await fetchYoutubeCues(videoId);
+    }
+  }
+
+  // For music videos or uncaptioned tracks, fetch time-synced lyrics from LRCLIB
+  if (cues.length === 0 && params.meta.title) {
+    const lrc = await fetchSyncedLyricsFallback(params.meta);
+    if (lrc.cues.length > 0) {
+      cues = lrc.cues;
+    } else if (lrc.plain) {
+      plainFallback = lrc.plain;
     }
   }
 
@@ -257,9 +344,10 @@ export async function extractRealTranscriptAndSummary(params: {
     }
   }
 
-  const fullText = cues.length > 0
-    ? cues.map((c) => c.text).join(" ").replace(/\s+/g, " ").trim()
-    : null;
+  const fullText =
+    cues.length > 0
+      ? cues.map((c) => c.text).join(" ").replace(/\s+/g, " ").trim()
+      : plainFallback;
 
   const transcript = fullText || (params.meta.description ? params.meta.description.slice(0, 2000) : null);
   const srt = params.wantSubtitles

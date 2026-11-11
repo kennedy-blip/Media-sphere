@@ -80,7 +80,12 @@ def extract_metadata(url: str, platform: str) -> dict[str, Any]:
         "extract_flat": False,
         "socket_timeout": 12,
         "retries": 2,
+        "js_runtimes": {"node": {}},
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv", "mweb"]}},
     }
+    proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTPS_PROXY")
+    if proxy:
+        ydl_opts["proxy"] = proxy
     ffmpeg_bin = get_ffmpeg_bin()
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
@@ -221,7 +226,12 @@ def download_stream(
         "socket_timeout": 15,
         "retries": 3,
         "progress_hooks": [_hook],
+        "js_runtimes": {"node": {}},
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv", "mweb"]}},
     }
+    proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTPS_PROXY")
+    if proxy:
+        ydl_opts["proxy"] = proxy
     ffmpeg_bin = get_ffmpeg_bin()
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
