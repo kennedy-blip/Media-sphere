@@ -4,7 +4,7 @@ import { useStore } from "./store";
 
 /**
  * Real-time progress via WebSocket (ws/wss://…/ws/queue) with polling fallback.
- * Pushes every 200ms from backend; falls back to 1.5s polling if WS is unavailable (e.g. serverless).
+ * Pushes every 200ms from FastAPI; falls back to 1.2s polling in serverless environments (e.g. Vercel).
  */
 export function connectProgressFeed() {
   const { upsertJob, setWsConnected, recordHistory } = useStore.getState();
@@ -20,8 +20,6 @@ export function connectProgressFeed() {
   let consecutiveFailures = 0;
 
   const recorded = new Set<string>();
-
-  // Seed recorded set from already-persisted history so page reloads don't duplicate entries
   for (const h of useStore.getState().history) {
     recorded.add(h.jobId);
   }
@@ -34,19 +32,43 @@ export function connectProgressFeed() {
     }
   }
 
+  async function pollOnce() {
+    const seen = new Set<string>();
+    try {
+      const res = await fetch(`${base}/api/v1/jobs`, { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        for (const j of (data.jobs as Job[]) || []) {
+          seen.add(j.id);
+          handleJob(j);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // In multi-instance serverless environments, also refresh any active job not yet in the current isolate's list
+    const pending = useStore
+      .getState()
+      .jobs.filter((j) => !["ready", "failed", "cancelled"].includes(j.status) && !seen.has(j.id));
+    await Promise.all(
+      pending.map(async (p) => {
+        try {
+          const r = await fetch(`${base}/api/v1/jobs/${encodeURIComponent(p.id)}`, { cache: "no-store" });
+          if (r.ok) {
+            handleJob((await r.json()) as Job);
+          }
+        } catch {
+          /* ignore */
+        }
+      })
+    );
+  }
+
   function startPolling() {
     if (pollTimer) return;
-    pollTimer = setInterval(async () => {
-      try {
-        const res = await fetch(`${base}/api/v1/jobs`);
-        if (res.ok) {
-          const data = await res.json();
-          (data.jobs as Job[]).forEach(handleJob);
-        }
-      } catch {
-        /* backend offline */
-      }
-    }, 1500);
+    void pollOnce();
+    pollTimer = setInterval(pollOnce, 1200);
   }
 
   function stopPolling() {
@@ -82,8 +104,10 @@ export function connectProgressFeed() {
       consecutiveFailures += 1;
       if (!closed) {
         startPolling();
-        const delay = Math.min(15000, 3000 * consecutiveFailures);
-        reconnectTimer = setTimeout(connect, delay);
+        // Avoid noisy infinite reconnect loops on pure serverless hosts without WS endpoints
+        if (consecutiveFailures <= 3) {
+          reconnectTimer = setTimeout(connect, 4000 * consecutiveFailures);
+        }
       }
     };
     ws.onerror = () => {

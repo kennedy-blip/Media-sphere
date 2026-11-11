@@ -1,18 +1,32 @@
 /**
  * Serverless fallback engine used when deployed standalone (e.g. Vercel without an external FastAPI URL).
- * In local dev / Docker / full-stack deployments, next.config.js `beforeFiles` rewrites route `/api/v1/*`
- * directly to the FastAPI + yt-dlp + FFmpeg + Faster-Whisper gateway.
+ * Combines `/tmp` warm-instance persistence with compact self-decoding job tokens in `job.id`
+ * (`<6hex>-<base64url>`) so jobs, transcripts, SRTs, and file downloads work reliably even across
+ * separate cold-started Vercel Serverless Function instances.
  */
 import crypto from "crypto";
-import { validateUrl } from "./sanitizer";
+import fs from "fs";
+import { detectPlatform, validateUrl } from "./sanitizer";
 import { validateTrimRange, type Job, type Preview } from "./api";
 
 const ALLOWED_RESOLUTIONS = new Set(["1080p", "720p", "480p", "360p", "2160p", "4k", "best", "audio"]);
 const ALLOWED_FORMATS = new Set(["mp4", "webm", "mp3", "wav"]);
+const TMP_STORE_PATH = "/tmp/mediasphere_jobs.json";
 
 interface StoredJob extends Job {
   createdAtMs: number;
   cancelledFlag: boolean;
+}
+
+interface CompactToken {
+  t: number; // createdAtMs
+  u: string; // sanitized_url
+  r: string; // resolution
+  f: string; // format
+  s?: string; // trim_start
+  e?: string; // trim_end
+  b: 0 | 1; // generate_subtitles
+  m: 0 | 1; // generate_summary
 }
 
 const g = globalThis as unknown as { __mediasphereJobs?: Map<string, StoredJob> };
@@ -20,6 +34,83 @@ if (!g.__mediasphereJobs) {
   g.__mediasphereJobs = new Map<string, StoredJob>();
 }
 const store = g.__mediasphereJobs;
+
+function syncFromDisk() {
+  try {
+    if (fs.existsSync(TMP_STORE_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(TMP_STORE_PATH, "utf8")) as StoredJob[];
+      for (const item of raw) {
+        const existing = store.get(item.id);
+        if (!existing || item.cancelledFlag) {
+          store.set(item.id, item);
+        }
+      }
+    }
+  } catch {
+    /* ignore disk sync errors */
+  }
+}
+
+function syncToDisk() {
+  try {
+    const items = Array.from(store.values()).slice(-100);
+    fs.writeFileSync(TMP_STORE_PATH, JSON.stringify(items), "utf8");
+  } catch {
+    /* ignore read-only fs errors */
+  }
+}
+
+function encodeJobId(token: CompactToken): string {
+  const prefix = crypto.randomBytes(3).toString("hex");
+  const payload = Buffer.from(JSON.stringify(token), "utf8").toString("base64url");
+  return `${prefix}-${payload}`;
+}
+
+function decodeJobFromId(id: string): StoredJob | null {
+  const dash = id.indexOf("-");
+  if (dash !== 6) return null;
+  try {
+    const json = Buffer.from(id.slice(7), "base64url").toString("utf8");
+    const t = JSON.parse(json) as CompactToken;
+    if (!t || typeof t.u !== "string" || typeof t.t !== "number") return null;
+    const host = new URL(t.u).hostname;
+    const platform = detectPlatform(host);
+    const meta = buildMockMetadata(t.u, platform);
+    const createdIso = new Date(t.t).toISOString();
+    return {
+      id,
+      url: t.u,
+      sanitized_url: t.u,
+      platform,
+      title: meta.title,
+      status: "queued",
+      progress: 5,
+      resolution: t.r || "1080p",
+      format: t.f || "mp4",
+      trim_start: t.s ?? null,
+      trim_end: t.e ?? null,
+      generate_subtitles: Boolean(t.b),
+      generate_summary: Boolean(t.m),
+      speed_mbps: 0,
+      eta_seconds: 3,
+      error: null,
+      created_at: createdIso,
+      updated_at: createdIso,
+      thumbnail: meta.thumbnail,
+      creator: meta.creator,
+      duration: meta.duration,
+      file_size: null,
+      download_url: null,
+      transcript: null,
+      summary: null,
+      srt: null,
+      createdAtMs: t.t,
+      cancelledFlag: false,
+    };
+  } catch {
+    return null;
+  }
+}
 
 function md5Hex(input: string): string {
   return crypto.createHash("md5").update(input).digest("hex");
@@ -81,8 +172,8 @@ export function buildMockMetadata(url: string, platform: string) {
   };
 }
 
-function buildTranscript(jobId: string) {
-  const h = md5Hex(jobId || "mediasphere");
+function buildTranscript(seedKey: string) {
+  const h = md5Hex(seedKey || "mediasphere");
   const seed = parseInt(h.slice(0, 6), 16);
   const openings = [
     "In this section, we cover the fundamentals and why they matter for creators today.",
@@ -154,7 +245,9 @@ export function validateJobOptions(body: {
   format?: string;
   trim_start?: string | null;
   trim_end?: string | null;
-}): { ok: true; resolution: string; format: string; trim_start: string | null; trim_end: string | null } | { ok: false; error: string } {
+}):
+  | { ok: true; resolution: string; format: string; trim_start: string | null; trim_end: string | null }
+  | { ok: false; error: string } {
   const rawRes = (body.resolution || "1080p").trim().toLowerCase();
   if (!ALLOWED_RESOLUTIONS.has(rawRes)) {
     return { ok: false, error: `Invalid resolution '${rawRes}'` };
@@ -177,23 +270,23 @@ function materialize(j: StoredJob): Job {
   if (!j.cancelledFlag && j.status !== "ready" && j.status !== "failed" && j.status !== "cancelled") {
     const elapsed = Date.now() - j.createdAtMs;
     const nowIso = new Date().toISOString();
-    if (elapsed < 700) {
+    if (elapsed < 800) {
       j.status = "extracting";
       j.progress = 20;
       j.speed_mbps = 3.2;
       j.eta_seconds = 3;
-    } else if (elapsed < 1900) {
+    } else if (elapsed < 2200) {
       j.status = "trimming";
-      j.progress = Math.min(78, 30 + Math.floor((elapsed - 700) / 25));
+      j.progress = Math.min(78, 30 + Math.floor((elapsed - 800) / 28));
       j.speed_mbps = 4.6;
       j.eta_seconds = 2;
-    } else if ((j.generate_subtitles || j.generate_summary) && elapsed < 2900) {
+    } else if ((j.generate_subtitles || j.generate_summary) && elapsed < 3400) {
       j.status = "transcribing";
       j.progress = 90;
       j.speed_mbps = 1.8;
       j.eta_seconds = 1;
     } else {
-      const ai = j.generate_subtitles || j.generate_summary ? buildTranscript(j.id) : null;
+      const ai = j.generate_subtitles || j.generate_summary ? buildTranscript(j.sanitized_url) : null;
       j.status = "ready";
       j.progress = 100;
       j.speed_mbps = 0;
@@ -223,9 +316,20 @@ export function createServerlessJob(params: {
   generate_subtitles: boolean;
   generate_summary: boolean;
 }): Job {
-  const id = crypto.randomBytes(6).toString("hex");
+  syncFromDisk();
+  const createdAtMs = Date.now();
+  const id = encodeJobId({
+    t: createdAtMs,
+    u: params.sanitized_url,
+    r: params.resolution,
+    f: params.format,
+    ...(params.trim_start ? { s: params.trim_start } : {}),
+    ...(params.trim_end ? { e: params.trim_end } : {}),
+    b: params.generate_subtitles ? 1 : 0,
+    m: params.generate_summary ? 1 : 0,
+  });
   const meta = buildMockMetadata(params.sanitized_url, params.platform);
-  const nowIso = new Date().toISOString();
+  const nowIso = new Date(createdAtMs).toISOString();
   const job: StoredJob = {
     id,
     url: params.url,
@@ -253,26 +357,41 @@ export function createServerlessJob(params: {
     transcript: null,
     summary: null,
     srt: null,
-    createdAtMs: Date.now(),
+    createdAtMs,
     cancelledFlag: false,
   };
   store.set(id, job);
+  syncToDisk();
   return materialize(job);
 }
 
 export function listServerlessJobs(): Job[] {
+  syncFromDisk();
   return Array.from(store.values())
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
     .map(materialize);
 }
 
 export function getServerlessJob(id: string): Job | null {
-  const j = store.get(id);
+  syncFromDisk();
+  let j = store.get(id) ?? null;
+  if (!j) {
+    j = decodeJobFromId(id);
+    if (j) {
+      store.set(id, j);
+      syncToDisk();
+    }
+  }
   return j ? materialize(j) : null;
 }
 
 export function cancelServerlessJob(id: string): { found: boolean; cancelled: boolean } {
-  const j = store.get(id);
+  syncFromDisk();
+  let j = store.get(id) ?? null;
+  if (!j) {
+    j = decodeJobFromId(id);
+    if (j) store.set(id, j);
+  }
   if (!j) return { found: false, cancelled: false };
   const current = materialize(j);
   if (["ready", "failed", "cancelled"].includes(current.status)) {
@@ -283,6 +402,7 @@ export function cancelServerlessJob(id: string): { found: boolean; cancelled: bo
   j.speed_mbps = 0;
   j.eta_seconds = null;
   j.updated_at = new Date().toISOString();
+  syncToDisk();
   return { found: true, cancelled: true };
 }
 
