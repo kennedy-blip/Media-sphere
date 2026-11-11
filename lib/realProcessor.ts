@@ -12,7 +12,7 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import { chooseFormat, Quality } from "@distube/ytdl-core";
 import { getSharedYtdl, resolveDirectStreamUrls } from "./realExtractor";
 import { extractYoutubeVideoId } from "./sanitizer";
-import { isHlsManifestUrl } from "./youtubeProviders";
+import { getYoutubeCandidateResolvers, isHlsManifestUrl, type ResolvedStream } from "./youtubeProviders";
 
 const execFileAsync = promisify(execFile);
 
@@ -336,54 +336,88 @@ export async function downloadAndProcessRealMedia(params: {
   let audioInput: string | undefined;
   let inputHeaders: Record<string, string> | undefined;
 
+  const stageStreamToInputs = async (direct: {
+    videoUrl?: string;
+    audioUrl?: string;
+    headers?: Record<string, string>;
+    isHls?: boolean;
+  }, wantAudioOnly: boolean) => {
+    inputHeaders = direct.headers;
+    const primaryStream = wantAudioOnly ? (direct.audioUrl || direct.videoUrl) : direct.videoUrl;
+    if (!primaryStream) {
+      throw new Error("Provider returned empty media URL");
+    }
+
+    if (direct.isHls || isHlsManifestUrl(primaryStream)) {
+      params.onProgress?.({ progress: 52, speedMbps: 2.4, etaSeconds: 5 });
+      if (wantAudioOnly) {
+        audioInput = primaryStream;
+      } else {
+        videoInput = primaryStream;
+        if (direct.audioUrl && direct.audioUrl !== primaryStream) {
+          audioInput = direct.audioUrl;
+        }
+      }
+      return;
+    }
+
+    if (wantAudioOnly) {
+      const audTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.media`);
+      safeUnlink(audTmp);
+      await downloadHttpUrlToFile(primaryStream, audTmp, direct.headers, params.onProgress, [30, 74]);
+      audioInput = audTmp;
+      return;
+    }
+
+    const vidTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_vid.mp4`);
+    safeUnlink(vidTmp);
+    await downloadHttpUrlToFile(primaryStream, vidTmp, direct.headers, params.onProgress, [30, 68]);
+    videoInput = vidTmp;
+
+    if (direct.audioUrl) {
+      const audTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.m4a`);
+      safeUnlink(audTmp);
+      try {
+        await downloadHttpUrlToFile(direct.audioUrl, audTmp, direct.headers, undefined, [68, 74]);
+        audioInput = audTmp;
+      } catch {
+        audioInput = undefined;
+      }
+    }
+  };
+
   try {
     params.onProgress?.({ progress: 26, speedMbps: 0, etaSeconds: 8 });
     const wantAudioOnly = params.resolution === "audio" || ext === "mp3" || ext === "wav";
+    const targetHeight =
+      params.resolution === "best" ? 2160 : parseInt(params.resolution.replace(/\D/g, ""), 10) || 1080;
 
-    try {
-      const direct = await resolveDirectStreamUrls(
-        params.url,
-        params.platform,
-        params.resolution,
-        ext
-      );
-      inputHeaders = direct.headers;
+    if (params.platform === "youtube") {
+      const videoId = extractYoutubeVideoId(params.url);
+      if (!videoId) throw new Error("Invalid YouTube video ID");
 
-      const primaryStream = wantAudioOnly ? (direct.audioUrl || direct.videoUrl) : direct.videoUrl;
-      if (!primaryStream) {
-        throw new Error("Provider returned empty media URL");
-      }
+      const candidateErrors: string[] = [];
+      let downloaded = false;
 
-      if (direct.isHls || isHlsManifestUrl(primaryStream)) {
-        // Let bundled FFmpeg demux & trim HLS segments directly
-        params.onProgress?.({ progress: 52, speedMbps: 2.4, etaSeconds: 5 });
-        if (wantAudioOnly) {
-          audioInput = primaryStream;
-        } else {
-          videoInput = primaryStream;
-          if (direct.audioUrl && direct.audioUrl !== primaryStream) {
-            audioInput = direct.audioUrl;
-          }
-        }
-      } else if (wantAudioOnly) {
-        audioInput = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.media`);
-        await downloadHttpUrlToFile(primaryStream, audioInput, direct.headers, params.onProgress, [30, 74]);
-      } else {
-        videoInput = path.join(MEDIA_TMP_DIR, `${params.fileKey}_vid.mp4`);
-        await downloadHttpUrlToFile(primaryStream, videoInput, direct.headers, params.onProgress, [30, 68]);
-        if (direct.audioUrl) {
-          const audTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.m4a`);
-          try {
-            await downloadHttpUrlToFile(direct.audioUrl, audTmp, direct.headers, undefined, [68, 74]);
-            audioInput = audTmp;
-          } catch {
-            audioInput = undefined;
-          }
+      for (const cand of getYoutubeCandidateResolvers(videoId, wantAudioOnly, targetHeight)) {
+        try {
+          videoInput = undefined;
+          audioInput = undefined;
+          inputHeaders = undefined;
+          const resolved: ResolvedStream = await cand.resolve();
+          await stageStreamToInputs(resolved, wantAudioOnly);
+          downloaded = true;
+          break;
+        } catch (err) {
+          safeUnlink(videoInput);
+          safeUnlink(audioInput);
+          videoInput = undefined;
+          audioInput = undefined;
+          candidateErrors.push(`${cand.name}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-    } catch (primaryErr) {
-      // Extra fallback for YouTube via @distube/ytdl-core if all relay providers failed
-      if (params.platform === "youtube") {
+
+      if (!downloaded) {
         try {
           const fb = await downloadYoutubeYtdlFallback(
             params.url,
@@ -394,12 +428,21 @@ export async function downloadAndProcessRealMedia(params: {
           );
           videoInput = fb.videoInput;
           audioInput = fb.audioInput;
-        } catch {
-          throw primaryErr;
+        } catch (ytdlErr) {
+          candidateErrors.push(
+            `ytdl: ${ytdlErr instanceof Error ? ytdlErr.message : String(ytdlErr)}`
+          );
+          throw new Error(`All YouTube stream providers failed (${candidateErrors.join(" | ")})`);
         }
-      } else {
-        throw primaryErr;
       }
+    } else {
+      const direct = await resolveDirectStreamUrls(
+        params.url,
+        params.platform,
+        params.resolution,
+        ext
+      );
+      await stageStreamToInputs(direct, wantAudioOnly);
     }
 
     params.onProgress?.({ progress: 78, speedMbps: 0, etaSeconds: 2 });

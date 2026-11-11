@@ -7,7 +7,7 @@ import { extractYoutubeVideoId } from "./sanitizer";
 import {
   fetchLivePipedStreams,
   probeMediaStreamUrl,
-  resolveViaCnvMp3,
+  resolveViaVidsSave,
   resolveYoutubeStreamRace,
   type LivePipedData,
 } from "./youtubeProviders";
@@ -727,7 +727,7 @@ export async function resolveDirectStreamUrls(
   platform: string,
   resolution: string,
   format: string,
-  fallbackTitle = "media"
+  _fallbackTitle = "media"
 ): Promise<DirectStreamBundle> {
   const wantAudioOnly = resolution === "audio" || format === "mp3" || format === "wav";
   const targetHeight = resolution === "best" ? 2160 : parseInt(resolution.replace(/\D/g, ""), 10) || 1080;
@@ -735,7 +735,7 @@ export async function resolveDirectStreamUrls(
   if (platform === "youtube") {
     const videoId = extractYoutubeVideoId(url);
     if (!videoId) throw new Error("Invalid YouTube video ID");
-    const resolved = await resolveYoutubeStreamRace(videoId, wantAudioOnly, targetHeight, fallbackTitle);
+    const resolved = await resolveYoutubeStreamRace(videoId, wantAudioOnly, targetHeight);
     return {
       videoUrl: resolved.videoUrl,
       audioUrl: resolved.audioUrl,
@@ -749,17 +749,32 @@ export async function resolveDirectStreamUrls(
     const tikwm = await fetchTikwm(url);
     if (tikwm) {
       if (wantAudioOnly && tikwm.music) {
-        const p = await probeMediaStreamUrl(tikwm.music).catch(() => null);
-        if (p) return { audioUrl: p.url, isHls: p.isHls, provider: "tikwm" };
+        return { audioUrl: tikwm.music, provider: "tikwm" };
       }
       const vUrl = tikwm.hdplay || tikwm.play;
       if (vUrl) {
-        const p = await probeMediaStreamUrl(vUrl).catch(() => null);
-        if (p) return { videoUrl: p.url, isHls: p.isHls, provider: "tikwm" };
+        return { videoUrl: vUrl, provider: "tikwm" };
       }
     }
-    const cnv = await resolveViaCnvMp3(url, wantAudioOnly, targetHeight, fallbackTitle);
-    return { videoUrl: cnv.videoUrl, audioUrl: cnv.audioUrl, headers: cnv.headers, isHls: cnv.isHls, provider: cnv.provider };
+    // Secondary Vercel-friendly TikTok relays
+    const [jawad, deline] = await Promise.all([
+      fetchJson<{ result?: { video?: string; audio?: string } }>(
+        `https://jawad-tech.vercel.app/download/tiktok?url=${encodeURIComponent(url)}`,
+        9000
+      ),
+      fetchJson<{ result?: { download?: string; music?: string } }>(
+        `https://api.deline.web.id/downloader/tiktok?url=${encodeURIComponent(url)}`,
+        9000
+      ),
+    ]);
+    if (wantAudioOnly && (jawad?.result?.audio || deline?.result?.music)) {
+      return { audioUrl: jawad?.result?.audio || deline?.result?.music, provider: "tiktok-relay" };
+    }
+    const backupVid = jawad?.result?.video || deline?.result?.download;
+    if (backupVid) {
+      return { videoUrl: backupVid, provider: "tiktok-relay" };
+    }
+    throw new Error("Could not resolve TikTok media stream");
   }
 
   if (platform === "x") {
@@ -772,12 +787,16 @@ export async function resolveDirectStreamUrls(
           .filter((v) => v.content_type === "video/mp4" && v.url)
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
         const candidate = mp4Variants[0]?.url || vid.url;
-        const p = await probeMediaStreamUrl(candidate).catch(() => null);
-        if (p) return { videoUrl: p.url, isHls: p.isHls, provider: "fxtwitter" };
+        return { videoUrl: candidate, provider: "fxtwitter" };
       }
+      const vx = await fetchJson<{ media_extended?: Array<{ url?: string; type?: string }> }>(
+        `https://api.vxtwitter.com/Twitter/status/${tweetId}`,
+        7000
+      );
+      const vxVid = vx?.media_extended?.find((m) => m.url && m.type === "video")?.url;
+      if (vxVid) return { videoUrl: vxVid, provider: "vxtwitter" };
     }
-    const cnv = await resolveViaCnvMp3(url, wantAudioOnly, targetHeight, fallbackTitle);
-    return { videoUrl: cnv.videoUrl, audioUrl: cnv.audioUrl, headers: cnv.headers, isHls: cnv.isHls, provider: cnv.provider };
+    throw new Error("Could not resolve X/Twitter video stream");
   }
 
   if (platform === "vimeo") {
@@ -824,11 +843,88 @@ export async function resolveDirectStreamUrls(
         provider: "reddit-dash",
       };
     }
-    const cnv = await resolveViaCnvMp3(url, wantAudioOnly, targetHeight, fallbackTitle);
-    return { videoUrl: cnv.videoUrl, audioUrl: cnv.audioUrl, headers: cnv.headers, isHls: cnv.isHls, provider: cnv.provider };
   }
 
-  // Generic OpenGraph og:video / JSON-LD contentUrl + CnvMP3 fallback (Instagram, Facebook, Twitch, Pinterest, LinkedIn)
+  if (platform === "instagram") {
+    const [sparky, jawad] = await Promise.all([
+      fetchJson<{ data?: Array<{ url?: string; type?: string }> }>(
+        `https://api-aswin-sparky.koyeb.app/api/downloader/igdl?url=${encodeURIComponent(url)}`,
+        10000
+      ),
+      fetchJson<{ result?: Array<{ url?: string; contentType?: string }> }>(
+        `https://jawad-tech.vercel.app/igdl?url=${encodeURIComponent(url)}`,
+        10000
+      ),
+    ]);
+    const igUrl =
+      sparky?.data?.find((i) => i?.url && i.type === "video")?.url ||
+      sparky?.data?.[0]?.url ||
+      jawad?.result?.find((i) => i?.url && String(i.contentType || "").includes("video"))?.url ||
+      jawad?.result?.[0]?.url;
+    if (igUrl && igUrl.startsWith("http")) {
+      return { videoUrl: igUrl, provider: "ig-relay" };
+    }
+  }
+
+  if (platform === "facebook") {
+    const [fb1, fb2] = await Promise.all([
+      fetchJson<{ data?: { high?: string; low?: string } }>(
+        `https://api-aswin-sparky.koyeb.app/api/downloader/fbdl?url=${encodeURIComponent(url)}`,
+        10000
+      ),
+      fetchJson<{ data?: { high?: string; low?: string } }>(
+        `https://api-aswin-sparky.koyeb.app/api/downloader/fbdl?ur=${encodeURIComponent(url)}`,
+        10000
+      ),
+    ]);
+    const fbUrl = fb1?.data?.high || fb1?.data?.low || fb2?.data?.high || fb2?.data?.low;
+    if (fbUrl && fbUrl.startsWith("http")) {
+      return { videoUrl: fbUrl, provider: "fb-relay" };
+    }
+  }
+
+  if (platform === "pinterest") {
+    const pinHtml = await fetchHtml(
+      `https://www.savepin.app/download.php?url=${encodeURIComponent(url)}&lang=en&type=redirect`,
+      9000,
+      BROWSER_UA
+    );
+    if (pinHtml) {
+      const m = pinHtml.match(/href="[^"]*url=(https?%3A%2F%2F[^"&]+\.mp4[^"&]*)"/i);
+      if (m?.[1]) {
+        const directPin = decodeURIComponent(m[1]);
+        if (directPin.startsWith("http")) {
+          return { videoUrl: directPin, provider: "savepin" };
+        }
+      }
+    }
+  }
+
+  if (platform === "linkedin") {
+    try {
+      const liRes = await fetch("https://saywhat.ai/api/fetch-linkedin-page/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Referer: "https://saywhat.ai/tools/linkedin-video-downloader/",
+          "User-Agent": BROWSER_UA,
+        },
+        body: JSON.stringify({ url }),
+        signal: AbortSignal.timeout(9000),
+      });
+      if (liRes.ok) {
+        const liJson = (await liRes.json()) as { videoUrl?: string; video_url?: string; url?: string };
+        const liVid = liJson?.videoUrl || liJson?.video_url || liJson?.url;
+        if (liVid && liVid.startsWith("http")) {
+          return { videoUrl: liVid, provider: "saywhat-linkedin" };
+        }
+      }
+    } catch {
+      /* fall through to OpenGraph */
+    }
+  }
+
+  // Generic OpenGraph og:video / JSON-LD contentUrl + VidsSave fallback
   const html =
     (await fetchHtml(url, 7000, "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)")) ||
     (await fetchHtml(url, 7000, BROWSER_UA));
@@ -849,9 +945,11 @@ export async function resolveDirectStreamUrls(
     }
   }
 
-  if (["instagram", "facebook", "twitch"].includes(platform)) {
-    const cnv = await resolveViaCnvMp3(url, wantAudioOnly, targetHeight, fallbackTitle);
-    return { videoUrl: cnv.videoUrl, audioUrl: cnv.audioUrl, headers: cnv.headers, isHls: cnv.isHls, provider: cnv.provider };
+  try {
+    const vs = await resolveViaVidsSave(url, wantAudioOnly, targetHeight);
+    return { videoUrl: vs.videoUrl, audioUrl: vs.audioUrl, headers: vs.headers, isHls: vs.isHls, provider: vs.provider };
+  } catch {
+    /* ignore */
   }
 
   throw new Error(`Direct stream download is restricted or unavailable for this ${platform} URL`);

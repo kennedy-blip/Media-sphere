@@ -1,21 +1,16 @@
 /**
- * Multi-Engine Resilient Media Stream Resolver (2026 Datacenter / Serverless Ready).
+ * Multi-Engine Resilient Media Stream Resolver (Vercel / Cloud Datacenter Ready).
  *
- * Why single-source YouTube extractors fail on Vercel/AWS:
- * - Direct YouTube InnerTube calls from AWS/cloud IPs frequently trigger `LOGIN_REQUIRED`
- *   ("Sign in to confirm you're not a bot"), and `WEB_EMBEDDED` is disabled on major-label
- *   music videos (e.g. Warner/UMG/SME official videos).
- * - Many legacy Piped/Invidious mirrors have disabled public stream proxying.
- *
- * Solution — Concurrent Provider Race + Byte-Level Stream Probing:
- * 1. SaveTube CDN Relay (`media.savetube.vip` AES-128-CBC v2 protocol) — residential worker pool
- * 2. CNV.CX / Y2Meta Converter Relay (`cnv.cx/v2` sanity-key protocol) — H.264 MP4 & 320k MP3
- * 3. Live Piped & Invidious Proxy Fleet (2026 verified instances + runtime registry discovery + HLS)
- * 4. Direct YouTube InnerTube (`VISIONOS` w/ visitorData, `ANDROID` 20.10, `youtubei.js` `ANDROID_VR`/`IOS`)
- * 5. CnvMP3 Converter Relay (`cnvmp3.com` — supports YouTube, TikTok, Instagram, X, Reddit, Twitch, Facebook)
- *
- * Every candidate URL is verified via a 64 KiB HTTP Range byte probe (rejecting HTML/JSON error
- * pages disguised as HTTP 200) before winning the race.
+ * Ordered & Raced Stream Providers for YouTube:
+ * 1. SaveTube Multi-CDN (`cdn400–cdn406.savetube.vip` + `media.savetube.vip` / `media.savetube.me`):
+ *    - AES-128-CBC `/v2/info` -> `/download` on the SAME CDN node that minted `info.key`,
+ *      sending `{ id, key, downloadType, quality }` with automatic quality (`720 -> 480 -> 360`)
+ *      and multi-node failover.
+ * 2. VidsSave API (`api.vidssave.com/api/contentsite_api/media/parse`):
+ *    - Returns direct CDN `download_url` video & audio resources from cloud IPs.
+ * 3. Live 2026 Piped & Invidious Proxy Fleet (`pipedapi.ducks.party`, `api.piped.private.coffee`,
+ *    etc. + runtime registry discovery, supporting MP4, adaptive mux, and `.m3u8` HLS).
+ * 4. Direct YouTube InnerTube (`VISIONOS` 1.02 w/ `visitorData`, `youtubei.js` `ANDROID_VR`/`IOS`).
  */
 import { createDecipheriv } from "crypto";
 import { Innertube, ClientType } from "youtubei.js";
@@ -57,14 +52,14 @@ export function isHlsManifestUrl(url: string): boolean {
 }
 
 /**
- * Probes the first <= 64 KiB of a candidate media URL and cancels immediately.
- * Prevents HTML/JSON error pages with HTTP 200 or 403-blocked googlevideo links from winning.
+ * Probes the first <= 64 KiB of multi-use streams (googlevideo / Piped / Invidious)
+ * to reject IP-blocked 403s or HTML error pages immediately.
  */
 export async function probeMediaStreamUrl(
   rawUrl: string,
   headers: Record<string, string> = {},
   signal?: AbortSignal,
-  timeoutMs = 16000
+  timeoutMs = 12000
 ): Promise<{ url: string; isHls: boolean }> {
   const normalized = normalizeHttpUrl(rawUrl);
   const looksLikeHls = isHlsManifestUrl(normalized);
@@ -113,10 +108,10 @@ export async function probeMediaStreamUrl(
       lower.startsWith('{"status":false') ||
       lower.startsWith('{"success":false')
     ) {
-      throw new Error("Stream probe detected HTML/JSON error payload instead of media");
+      throw new Error("Stream probe detected HTML/JSON error payload");
     }
     if (looksLikeHls) {
-      throw new Error("Expected #EXTM3U HLS playlist but received non-HLS response");
+      throw new Error("Expected #EXTM3U HLS playlist");
     }
   } finally {
     await reader.cancel().catch(() => undefined);
@@ -131,19 +126,37 @@ function snapQuality(targetHeight: number, allowed = [1080, 720, 480, 360]): num
 }
 
 // ============================================================================
-// ENGINE 1: SAVETUBE RESIDENTIAL CDN RELAY (AES-128-CBC v2)
+// ENGINE 1: SAVETUBE MULTI-CDN RELAY (SAME-NODE KEY BINDING + `{ id, key }`)
 // ============================================================================
 
-const SAVETUBE_CDN_DISCOVERY = "https://media.savetube.vip/api/random-cdn";
-const SAVETUBE_ORIGIN = "https://save-tube.com";
+const SAVETUBE_STATIC_CDNS = [
+  "cdn406.savetube.vip",
+  "cdn405.savetube.vip",
+  "cdn404.savetube.vip",
+  "cdn403.savetube.vip",
+  "cdn402.savetube.vip",
+  "cdn401.savetube.vip",
+  "cdn400.savetube.vip",
+];
+
+const SAVETUBE_RANDOM_ENDPOINTS = [
+  "https://media.savetube.vip/api/random-cdn",
+  "https://media.savetube.me/api/random-cdn",
+];
+
 const SAVETUBE_AES_KEY = Buffer.from("C5D58EF67A7584E4A29F6C35BBC4EB12", "hex");
 
-interface SaveTubeFormat {
-  quality?: number | string;
-  height?: number | string;
-  label?: string;
-  url?: string | null;
-}
+const SAVETUBE_API_HEADERS: Record<string, string> = {
+  "Content-Type": "application/json",
+  Origin: "https://yt.savetube.me",
+  Referer: "https://yt.savetube.me/",
+  "User-Agent": DESKTOP_UA,
+};
+
+const SAVETUBE_MEDIA_HEADERS: Record<string, string> = {
+  Referer: "https://yt.savetube.me/",
+  "User-Agent": DESKTOP_UA,
+};
 
 interface SaveTubeMeta {
   id: string;
@@ -151,33 +164,12 @@ interface SaveTubeMeta {
   title?: string;
   duration?: number;
   thumbnail?: string;
-  video_formats?: SaveTubeFormat[];
-  audio_formats?: SaveTubeFormat[];
-}
-
-function saveTubeHeaders(extra: Record<string, string> = {}): Record<string, string> {
-  return {
-    "User-Agent": DESKTOP_UA,
-    Origin: SAVETUBE_ORIGIN,
-    Referer: `${SAVETUBE_ORIGIN}/`,
-    ...extra,
-  };
-}
-
-async function getSaveTubeCdn(signal?: AbortSignal): Promise<string> {
-  const res = await fetch(SAVETUBE_CDN_DISCOVERY, {
-    headers: saveTubeHeaders({ Accept: "application/json" }),
-    redirect: "follow",
-    signal: combineSignal(signal, 8000),
-  });
-  if (!res.ok) throw new Error(`SaveTube CDN HTTP ${res.status}`);
-  const data = (await res.json()) as { cdn?: string };
-  if (!data?.cdn) throw new Error("SaveTube returned empty CDN");
-  return data.cdn;
+  video_formats?: Array<{ quality?: number | string; height?: number | string }>;
+  audio_formats?: Array<{ quality?: number | string }>;
 }
 
 function decryptSaveTubePayload(encoded: string): SaveTubeMeta {
-  const raw = Buffer.from(encoded, "base64");
+  const raw = Buffer.from(String(encoded).replace(/\s/g, ""), "base64");
   if (raw.length <= 16) throw new Error("Invalid SaveTube encrypted payload");
   const iv = raw.subarray(0, 16);
   const ciphertext = raw.subarray(16);
@@ -186,266 +178,238 @@ function decryptSaveTubePayload(encoded: string): SaveTubeMeta {
   return JSON.parse(plain) as SaveTubeMeta;
 }
 
+async function discoverSaveTubeCdns(signal?: AbortSignal): Promise<string[]> {
+  const found: string[] = [];
+  await Promise.allSettled(
+    SAVETUBE_RANDOM_ENDPOINTS.map(async (ep) => {
+      const res = await fetch(ep, {
+        headers: SAVETUBE_API_HEADERS,
+        redirect: "follow",
+        signal: combineSignal(signal, 6000),
+      });
+      if (!res.ok) return;
+      const json = (await res.json()) as { cdn?: string; data?: { cdn?: string } };
+      const cdn = json?.cdn || json?.data?.cdn;
+      if (cdn && typeof cdn === "string") {
+        found.push(cdn.trim());
+      }
+    })
+  );
+  return Array.from(new Set([...found, ...SAVETUBE_STATIC_CDNS]));
+}
+
+async function fetchSaveTubeNodeInfo(
+  cdn: string,
+  watchUrl: string,
+  signal?: AbortSignal
+): Promise<{ cdn: string; info: SaveTubeMeta }> {
+  const res = await fetch(`https://${cdn}/v2/info`, {
+    method: "POST",
+    headers: SAVETUBE_API_HEADERS,
+    body: JSON.stringify({ url: watchUrl }),
+    redirect: "follow",
+    signal: combineSignal(signal, 18000),
+  });
+  const json = (await res.json().catch(() => null)) as {
+    status?: boolean;
+    data?: string;
+    message?: string;
+  } | null;
+  if (!res.ok || !json?.data) {
+    throw new Error(json?.message || `SaveTube ${cdn} info HTTP ${res.status}`);
+  }
+  const info = decryptSaveTubePayload(json.data);
+  if (!info?.key) {
+    throw new Error(`SaveTube ${cdn} returned no key`);
+  }
+  return { cdn, info };
+}
+
+async function requestSaveTubeDownloadLink(
+  cdn: string,
+  videoId: string,
+  key: string,
+  downloadType: "video" | "audio",
+  quality: string,
+  signal?: AbortSignal
+): Promise<string> {
+  const res = await fetch(`https://${cdn}/download`, {
+    method: "POST",
+    headers: SAVETUBE_API_HEADERS,
+    body: JSON.stringify({
+      id: videoId,
+      downloadType,
+      quality,
+      key,
+    }),
+    redirect: "follow",
+    signal: combineSignal(signal, 55000),
+  });
+  const json = (await res.json().catch(() => null)) as {
+    status?: boolean;
+    downloadUrl?: string;
+    data?: { downloadUrl?: string; download_url?: string };
+    message?: string;
+  } | null;
+  const link = json?.data?.downloadUrl || json?.data?.download_url || json?.downloadUrl;
+  if (!link || typeof link !== "string") {
+    throw new Error(json?.message || `SaveTube ${cdn} ${quality} returned no downloadUrl`);
+  }
+  return normalizeHttpUrl(link);
+}
+
 export async function resolveViaSaveTube(
   videoId: string,
   wantAudioOnly: boolean,
   targetHeight: number,
   signal?: AbortSignal
 ): Promise<ResolvedStream> {
-  const cdn = await getSaveTubeCdn(signal);
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cdns = await discoverSaveTubeCdns(signal);
 
-  const infoRes = await fetch(`https://${cdn}/v2/info`, {
-    method: "POST",
-    headers: saveTubeHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ url: watchUrl }),
-    redirect: "follow",
-    signal: combineSignal(signal, 16000),
-  });
-  const infoJson = (await infoRes.json().catch(() => null)) as { status?: boolean; data?: string } | null;
-  if (!infoRes.ok || !infoJson?.status || !infoJson.data) {
-    throw new Error(`SaveTube info HTTP ${infoRes.status}`);
+  // Query up to 5 CDN nodes in parallel for /v2/info so we have healthy nodes ready
+  const settledInfos = await Promise.allSettled(
+    cdns.slice(0, 5).map((cdn) => fetchSaveTubeNodeInfo(cdn, watchUrl, signal))
+  );
+  const readyNodes = settledInfos
+    .filter((r): r is PromiseFulfilledResult<{ cdn: string; info: SaveTubeMeta }> => r.status === "fulfilled")
+    .map((r) => r.value);
+
+  if (readyNodes.length === 0) {
+    const firstRej = settledInfos.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+    throw new Error(firstRej ? String(firstRej.reason?.message || firstRej.reason) : "SaveTube /v2/info failed on all CDNs");
   }
-
-  const meta = decryptSaveTubePayload(infoJson.data);
-  if (!meta.key) throw new Error("SaveTube missing conversion key");
-
-  const dlCdn = await getSaveTubeCdn(signal).catch(() => cdn);
-  const dlHeaders = saveTubeHeaders();
-
-  if (wantAudioOnly) {
-    const audioQualities = (meta.audio_formats || [])
-      .map((f) => parseInt(String(f.quality ?? "128").replace(/\D/g, ""), 10))
-      .filter((n) => Number.isFinite(n) && n > 0)
-      .sort((a, b) => b - a);
-    const chosenQ = String(audioQualities[0] || 128);
-
-    const dlRes = await fetch(`https://${dlCdn}/download`, {
-      method: "POST",
-      headers: saveTubeHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ downloadType: "audio", quality: chosenQ, key: meta.key }),
-      redirect: "follow",
-      signal: combineSignal(signal, 18000),
-    });
-    const dlJson = (await dlRes.json().catch(() => null)) as {
-      status?: boolean;
-      data?: { downloadUrl?: string };
-    } | null;
-    const link = dlJson?.data?.downloadUrl;
-    if (!link) throw new Error("SaveTube audio link empty");
-
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const probed = await probeMediaStreamUrl(link, dlHeaders, signal, 14000);
-        return { audioUrl: probed.url, headers: dlHeaders, isHls: probed.isHls, provider: "savetube" };
-      } catch (err) {
-        if (attempt === 3 || signal?.aborted) throw err;
-        await new Promise((r) => setTimeout(r, 1400));
-      }
-    }
-  }
-
-  // Video quality candidates (closest <= targetHeight first, then fallback qualities)
-  const availableHeights = Array.from(
-    new Set(
-      (meta.video_formats || [])
-        .map((f) => parseInt(String(f.quality ?? f.height ?? "").replace(/\D/g, ""), 10))
-        .filter((n) => Number.isFinite(n) && n >= 144)
-    )
-  ).sort((a, b) => b - a);
-
-  const leq = availableHeights.filter((h) => h <= targetHeight);
-  const candidates = leq.length > 0 ? leq.slice(0, 2) : availableHeights.length > 0 ? [availableHeights[availableHeights.length - 1]] : [720, 360];
 
   let lastErr: unknown = null;
-  for (const q of candidates) {
-    try {
-      const dlRes = await fetch(`https://${dlCdn}/download`, {
-        method: "POST",
-        headers: saveTubeHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ downloadType: "video", quality: String(q), key: meta.key }),
-        redirect: "follow",
-        signal: combineSignal(signal, 18000),
-      });
-      const dlJson = (await dlRes.json().catch(() => null)) as {
-        status?: boolean;
-        data?: { downloadUrl?: string };
-      } | null;
-      const link = dlJson?.data?.downloadUrl;
-      if (!link) throw new Error(`SaveTube ${q}p link empty`);
 
-      for (let attempt = 0; attempt < 4; attempt++) {
+  // Try up to 3 distinct ready CDN nodes; CRITICAL: always send /download to the SAME `cdn` that minted `info.key`!
+  for (const { cdn, info } of readyNodes.slice(0, 3)) {
+    const resolvedId = info.id || videoId;
+
+    if (wantAudioOnly) {
+      for (const audioQ of ["128", "320"]) {
         try {
-          const probed = await probeMediaStreamUrl(link, dlHeaders, signal, 14000);
-          return { videoUrl: probed.url, headers: dlHeaders, isHls: probed.isHls, provider: "savetube" };
+          const link = await requestSaveTubeDownloadLink(cdn, resolvedId, info.key, "audio", audioQ, signal);
+          return { audioUrl: link, headers: SAVETUBE_MEDIA_HEADERS, provider: `savetube:${cdn}` };
         } catch (err) {
-          if (attempt === 3 || signal?.aborted) throw err;
-          await new Promise((r) => setTimeout(r, 1400));
+          lastErr = err;
         }
       }
-    } catch (err) {
-      lastErr = err;
+      continue;
+    }
+
+    // Video qualities: prefer requested height (720/1080/480/360), then cascade 720 -> 480 -> 360
+    const preferred = String(snapQuality(targetHeight, [1080, 720, 480, 360]));
+    const qualityOrder = Array.from(new Set([preferred, "720", "480", "360"]));
+
+    for (const q of qualityOrder) {
+      try {
+        const link = await requestSaveTubeDownloadLink(cdn, resolvedId, info.key, "video", q, signal);
+        return { videoUrl: link, headers: SAVETUBE_MEDIA_HEADERS, provider: `savetube:${cdn}:${q}p` };
+      } catch (err) {
+        lastErr = err;
+      }
     }
   }
 
-  throw lastErr instanceof Error ? lastErr : new Error("SaveTube video resolution failed");
+  throw lastErr instanceof Error ? lastErr : new Error("SaveTube download failed across CDN nodes");
 }
 
 // ============================================================================
-// ENGINE 2: CNV.CX / Y2META CONVERTER RELAY
+// ENGINE 2: VIDSSAVE API (`api.vidssave.com/api/contentsite_api/media/parse`)
 // ============================================================================
 
-const CNVCX_ORIGIN = "https://frame.y2meta-uk.com";
-const CNVCX_BASE = "https://cnv.cx/v2";
-
-export async function resolveViaCnvCx(
-  videoId: string,
+export async function resolveViaVidsSave(
+  videoIdOrUrl: string,
   wantAudioOnly: boolean,
   targetHeight: number,
   signal?: AbortSignal
 ): Promise<ResolvedStream> {
-  const reqHeaders = {
-    "User-Agent": DESKTOP_UA,
-    Origin: CNVCX_ORIGIN,
-    Referer: `${CNVCX_ORIGIN}/`,
-  };
+  const link = videoIdOrUrl.startsWith("http")
+    ? videoIdOrUrl
+    : `https://www.youtube.com/watch?v=${videoIdOrUrl}`;
 
-  const keyRes = await fetch(`${CNVCX_BASE}/sanity/key?id=${encodeURIComponent(videoId)}`, {
-    headers: { ...reqHeaders, Accept: "application/json, text/plain, */*" },
-    redirect: "follow",
-    signal: combineSignal(signal, 14000),
+  const body = new URLSearchParams({
+    auth: "20250901majwlqo",
+    domain: "api-ak.vidssave.com",
+    origin: "cache",
+    link,
   });
-  const keyJson = (await keyRes.json().catch(() => null)) as { key?: string; errorMsg?: string } | null;
-  if (!keyRes.ok || !keyJson?.key) {
-    throw new Error(keyJson?.errorMsg || `CNV.CX key HTTP ${keyRes.status}`);
-  }
 
-  const qualities = wantAudioOnly
-    ? [320]
-    : Array.from(new Set([snapQuality(targetHeight, [1080, 720, 480, 360]), 720, 360])).slice(0, 2);
-
-  let lastErr: unknown = null;
-  for (const q of qualities) {
-    try {
-      const body = new URLSearchParams({
-        link: `https://youtu.be/${videoId}`,
-        format: wantAudioOnly ? "mp3" : "mp4",
-        filenameStyle: "pretty",
-        vCodec: "h264",
-        audioBitrate: wantAudioOnly ? String(q) : "128",
-        videoQuality: wantAudioOnly ? "720" : String(q),
-      });
-
-      const convRes = await fetch(`${CNVCX_BASE}/converter`, {
-        method: "POST",
-        headers: {
-          ...reqHeaders,
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "*/*",
-          key: keyJson.key,
-        },
-        body: body.toString(),
-        redirect: "follow",
-        signal: combineSignal(signal, 45000),
-      });
-      const convJson = (await convRes.json().catch(() => null)) as {
-        url?: string;
-        errorMsg?: string;
-        message?: string;
-      } | null;
-      if (!convRes.ok || !convJson?.url) {
-        throw new Error(convJson?.errorMsg || convJson?.message || `CNV.CX convert HTTP ${convRes.status}`);
-      }
-
-      const probed = await probeMediaStreamUrl(convJson.url, reqHeaders, signal, 16000);
-      if (wantAudioOnly) {
-        return { audioUrl: probed.url, headers: reqHeaders, isHls: probed.isHls, provider: "cnvcx" };
-      }
-      return { videoUrl: probed.url, headers: reqHeaders, isHls: probed.isHls, provider: "cnvcx" };
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-
-  throw lastErr instanceof Error ? lastErr : new Error("CNV.CX conversion failed");
-}
-
-// ============================================================================
-// ENGINE 3: CNVMP3 MULTI-PLATFORM CONVERTER (YouTube, TikTok, IG, X, Reddit, FB)
-// ============================================================================
-
-const CNVMP3_BASE = "https://cnvmp3.com";
-const CNVMP3_REFERER = `${CNVMP3_BASE}/v55`;
-
-export async function resolveViaCnvMp3(
-  sourceUrl: string,
-  wantAudioOnly: boolean,
-  targetHeight: number,
-  fallbackTitle = "media",
-  signal?: AbortSignal
-): Promise<ResolvedStream> {
-  const mediaHeaders = {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    Accept: "application/json, text/plain, */*",
+    Origin: "https://vidssave.com",
+    Referer: "https://vidssave.com/",
+    "X-Requested-With": "XMLHttpRequest",
     "User-Agent": DESKTOP_UA,
-    Referer: CNVMP3_REFERER,
   };
 
-  let title = fallbackTitle;
-  try {
-    const infoRes = await fetch(`${CNVMP3_BASE}/get_video_data.php`, {
-      method: "POST",
-      headers: {
-        ...mediaHeaders,
-        "Content-Type": "application/json",
-        Accept: "application/json, text/plain, */*",
-      },
-      body: JSON.stringify({ url: sourceUrl, token: "1234" }),
-      redirect: "follow",
-      signal: combineSignal(signal, 18000),
-    });
-    const infoJson = (await infoRes.json().catch(() => null)) as { title?: string } | null;
-    if (infoJson?.title && typeof infoJson.title === "string" && infoJson.title.trim()) {
-      title = infoJson.title.trim();
-    }
-  } catch {
-    /* proceed with fallback title */
-  }
-
-  const quality = wantAudioOnly ? 0 : snapQuality(targetHeight, [1080, 720, 480, 360]);
-  const dlRes = await fetch(`${CNVMP3_BASE}/download_video_ucep.php`, {
+  const res = await fetch("https://api.vidssave.com/api/contentsite_api/media/parse", {
     method: "POST",
-    headers: {
-      ...mediaHeaders,
-      "Content-Type": "application/json",
-      Accept: "application/json, text/plain, */*",
-    },
-    body: JSON.stringify({
-      url: sourceUrl,
-      quality,
-      title,
-      formatValue: wantAudioOnly ? 1 : 0,
-    }),
+    headers,
+    body: body.toString(),
     redirect: "follow",
-    signal: combineSignal(signal, 55000),
+    signal: combineSignal(signal, 18000),
   });
-  const dlJson = (await dlRes.json().catch(() => null)) as {
-    download_link?: string;
-    error?: string;
-    message?: string;
+
+  const json = (await res.json().catch(() => null)) as {
+    status?: number;
+    data?: {
+      resources?: Array<{
+        type?: string;
+        format?: string;
+        quality?: string | number;
+        download_url?: string;
+      }>;
+    };
   } | null;
 
-  if (!dlRes.ok || !dlJson?.download_link) {
-    throw new Error(dlJson?.error || dlJson?.message || `CnvMP3 HTTP ${dlRes.status}`);
+  if (!res.ok || json?.status !== 1 || !Array.isArray(json?.data?.resources)) {
+    throw new Error(`VidsSave HTTP ${res.status}`);
   }
 
-  const probed = await probeMediaStreamUrl(dlJson.download_link, mediaHeaders, signal, 18000);
-  if (wantAudioOnly) {
-    return { audioUrl: probed.url, headers: mediaHeaders, isHls: probed.isHls, provider: "cnvmp3" };
+  const dlHeaders = {
+    Referer: "https://vidssave.com/",
+    "User-Agent": DESKTOP_UA,
+  };
+
+  const resources = json.data.resources.filter((r) => typeof r.download_url === "string" && r.download_url.startsWith("http"));
+  if (!resources.length) {
+    throw new Error("VidsSave returned empty resources");
   }
-  return { videoUrl: probed.url, headers: mediaHeaders, isHls: probed.isHls, provider: "cnvmp3" };
+
+  if (wantAudioOnly) {
+    const aud = resources.find((r) => r.type === "audio") || resources[0];
+    return {
+      audioUrl: normalizeHttpUrl(aud.download_url!),
+      headers: dlHeaders,
+      provider: "vidssave",
+    };
+  }
+
+  const vids = resources
+    .filter((r) => r.type === "video")
+    .map((r) => ({
+      url: r.download_url!,
+      height: parseInt(String(r.quality ?? "720").replace(/\D/g, ""), 10) || 720,
+    }))
+    .sort((a, b) => b.height - a.height);
+
+  const chosen = vids.find((v) => v.height <= targetHeight) || vids[vids.length - 1];
+  if (!chosen) {
+    throw new Error("VidsSave returned no video stream");
+  }
+
+  return {
+    videoUrl: normalizeHttpUrl(chosen.url),
+    headers: dlHeaders,
+    provider: `vidssave:${chosen.height}p`,
+  };
 }
 
 // ============================================================================
-// ENGINE 4: LIVE PIPED & INVIDIOUS PROXY FLEET (2026 Verified + Dynamic Registry)
+// ENGINE 3: LIVE PIPED & INVIDIOUS PROXY FLEET (2026 Verified + Dynamic Registry)
 // ============================================================================
 
 const BUILTIN_PIPED_APIS = [
@@ -568,7 +532,6 @@ export async function resolveViaPipedAndInvidious(
   signal?: AbortSignal
 ): Promise<ResolvedStream> {
   const { piped, invidious } = await getLiveProxyBases(signal);
-
   const tasks: Array<Promise<ResolvedStream>> = [];
 
   for (const base of piped.slice(0, 6)) {
@@ -659,7 +622,7 @@ export async function resolveViaPipedAndInvidious(
 }
 
 // ============================================================================
-// ENGINE 5: DIRECT YOUTUBE INNERTUBE (VISIONOS w/ visitorData + ANDROID_VR + IOS)
+// ENGINE 4: DIRECT YOUTUBE INNERTUBE (VISIONOS w/ visitorData + ANDROID_VR + IOS)
 // ============================================================================
 
 let cachedVisitorData: { token: string; at: number } | null = null;
@@ -701,7 +664,6 @@ export async function resolveViaInnerTubeDirect(
   targetHeight: number,
   signal?: AbortSignal
 ): Promise<ResolvedStream> {
-  // 5A: Direct VISIONOS 1.02 + visitorData (no JS cipher or PO token required)
   try {
     const visitorData = await fetchYoutubeVisitorData(signal);
     const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
@@ -772,7 +734,6 @@ export async function resolveViaInnerTubeDirect(
     /* try next client */
   }
 
-  // 5B: youtubei.js ANDROID_VR / IOS
   try {
     const yt = await Innertube.create({ retrieve_player: false });
     for (const client of [ClientType.ANDROID_VR, ClientType.IOS]) {
@@ -817,51 +778,50 @@ export async function resolveViaInnerTubeDirect(
 }
 
 // ============================================================================
-// MASTER YOUTUBE PROVIDER RACE
+// ORDERED CANDIDATE LIST FOR DOWNLOAD-TIME FAILOVER
 // ============================================================================
+
+/**
+ * Returns an ordered list of stream resolver thunks so that if downloading the
+ * bytes of Provider 1 fails mid-flight, `realProcessor.ts` seamlessly tries Provider 2+.
+ */
+export function getYoutubeCandidateResolvers(
+  videoId: string,
+  wantAudioOnly: boolean,
+  targetHeight: number
+): Array<{ name: string; resolve: () => Promise<ResolvedStream> }> {
+  return [
+    {
+      name: "SaveTube",
+      resolve: () => resolveViaSaveTube(videoId, wantAudioOnly, targetHeight),
+    },
+    {
+      name: "VidsSave",
+      resolve: () => resolveViaVidsSave(videoId, wantAudioOnly, targetHeight),
+    },
+    {
+      name: "Piped/Invidious",
+      resolve: () => resolveViaPipedAndInvidious(videoId, wantAudioOnly, targetHeight),
+    },
+    {
+      name: "InnerTube",
+      resolve: () => resolveViaInnerTubeDirect(videoId, wantAudioOnly, targetHeight),
+    },
+  ];
+}
 
 export async function resolveYoutubeStreamRace(
   videoId: string,
   wantAudioOnly: boolean,
-  targetHeight: number,
-  fallbackTitle = "youtube_media"
+  targetHeight: number
 ): Promise<ResolvedStream> {
-  const raceAbort = new AbortController();
   const errors: string[] = [];
-
-  const wrap = (name: string, fn: (sig: AbortSignal) => Promise<ResolvedStream>) =>
-    fn(raceAbort.signal).catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`${name}: ${msg}`);
-      throw err;
-    });
-
-  // Tier 1: Concurrent fast race across SaveTube CDN, CNV.CX, Live Piped/Invidious, and Direct InnerTube
-  try {
-    const winner = await Promise.any([
-      wrap("SaveTube", (sig) => resolveViaSaveTube(videoId, wantAudioOnly, targetHeight, sig)),
-      wrap("CNV.CX", (sig) => resolveViaCnvCx(videoId, wantAudioOnly, targetHeight, sig)),
-      wrap("Piped/Invidious", (sig) => resolveViaPipedAndInvidious(videoId, wantAudioOnly, targetHeight, sig)),
-      wrap("InnerTube", (sig) => resolveViaInnerTubeDirect(videoId, wantAudioOnly, targetHeight, sig)),
-    ]);
-    raceAbort.abort();
-    return winner;
-  } catch {
-    raceAbort.abort();
+  for (const cand of getYoutubeCandidateResolvers(videoId, wantAudioOnly, targetHeight)) {
+    try {
+      return await cand.resolve();
+    } catch (err) {
+      errors.push(`${cand.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
-
-  // Tier 2: CnvMP3 server-side transcode fallback
-  try {
-    return await resolveViaCnvMp3(
-      `https://www.youtube.com/watch?v=${videoId}`,
-      wantAudioOnly,
-      targetHeight,
-      fallbackTitle
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`CnvMP3: ${msg}`);
-  }
-
   throw new Error(`All YouTube stream providers failed (${errors.join(" | ")})`);
 }
