@@ -1,15 +1,17 @@
 "use client";
 import { useMemo, useState } from "react";
-import { X, Layers, Loader2, AlertCircle } from "lucide-react";
-import { api } from "@/lib/api";
+import { X, Layers, Loader2, AlertCircle, Scissors } from "lucide-react";
+import { api, validateTrimRange } from "@/lib/api";
 import { parseBatchInput, validateUrl } from "@/lib/sanitizer";
 import { useStore } from "@/lib/store";
 
 export default function BatchDrawer() {
-  const { batchOpen, setBatchOpen, setTab } = useStore();
+  const { batchOpen, setBatchOpen, upsertJob, setTab } = useStore();
   const [text, setText] = useState("");
   const [resolution, setResolution] = useState("1080p");
   const [format, setFormat] = useState("mp4");
+  const [trimStart, setTrimStart] = useState("");
+  const [trimEnd, setTrimEnd] = useState("");
   const [subtitles, setSubtitles] = useState(true);
   const [summary, setSummary] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -18,26 +20,49 @@ export default function BatchDrawer() {
 
   const urls = useMemo(() => parseBatchInput(text), [text]);
   const validUrls = useMemo(() => urls.filter((u) => validateUrl(u).valid), [urls]);
+  const trimErr = useMemo(() => validateTrimRange(trimStart, trimEnd), [trimStart, trimEnd]);
 
   if (!batchOpen) return null;
+
+  function closeDrawer() {
+    setBatchOpen(false);
+    setError(null);
+    setResult(null);
+  }
 
   async function submit() {
     if (!validUrls.length) {
       setError("No valid URLs in batch input");
       return;
     }
+    if (validUrls.length > 20) {
+      setError("Maximum 20 URLs per batch");
+      return;
+    }
+    if (trimErr) {
+      setError(trimErr);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
       const data = await api.createBatch({
-        urls: validUrls, resolution, format,
-        generate_subtitles: subtitles, generate_summary: summary,
+        urls: validUrls,
+        resolution,
+        format,
+        trim_start: trimStart.trim() || null,
+        trim_end: trimEnd.trim() || null,
+        generate_subtitles: subtitles,
+        generate_summary: summary,
       });
+      data.jobs.forEach((j) => upsertJob(j));
       setResult(`Dispatched ${data.created} job(s)${data.errors.length ? ` · ${data.errors.length} skipped (invalid)` : ""}`);
       setTimeout(() => {
+        setText("");
+        setResult(null);
         setBatchOpen(false);
         setTab("active");
-      }, 1200);
+      }, 900);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Batch dispatch failed");
     } finally {
@@ -46,7 +71,10 @@ export default function BatchDrawer() {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-end bg-black/60 backdrop-blur-sm sm:items-center sm:justify-center" onClick={() => setBatchOpen(false)}>
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-end bg-black/60 backdrop-blur-sm sm:items-center sm:justify-center"
+      onClick={closeDrawer}
+    >
       <div
         className="w-full max-w-lg rounded-t-2xl sm:rounded-2xl border border-white/10 bg-panel p-5 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
@@ -55,7 +83,7 @@ export default function BatchDrawer() {
           <h3 className="text-sm font-semibold text-white flex items-center gap-2">
             <Layers className="w-4 h-4 text-accent" /> Batch processing drawer
           </h3>
-          <button onClick={() => setBatchOpen(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10">
+          <button type="button" onClick={closeDrawer} className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -64,7 +92,7 @@ export default function BatchDrawer() {
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder={"Paste multiple URLs — one per line or comma-separated:\nhttps://www.youtube.com/watch?v=…\nhttps://www.tiktok.com/@…/video/…\nhttps://www.instagram.com/reel/…"}
-          rows={8}
+          rows={7}
           className="w-full rounded-xl bg-ink border border-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-accent/60"
         />
         <p className="mt-2 text-xs text-slate-400">{urls.length} parsed · {validUrls.length} valid · max 20</p>
@@ -72,40 +100,88 @@ export default function BatchDrawer() {
         <div className="mt-4 grid grid-cols-2 gap-3">
           <label className="text-xs text-slate-400">
             Resolution
-            <select value={resolution} onChange={(e) => setResolution(e.target.value)} className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white">
-              {["1080p", "720p", "480p", "360p", "best", "audio"].map((r) => <option key={r} value={r}>{r}</option>)}
+            <select
+              value={resolution}
+              onChange={(e) => setResolution(e.target.value)}
+              className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
+            >
+              {["2160p", "1080p", "720p", "480p", "360p", "best", "audio"].map((r) => (
+                <option key={r} value={r}>{r === "2160p" ? "4K (2160p)" : r}</option>
+              ))}
             </select>
           </label>
           <label className="text-xs text-slate-400">
             Format
-            <select value={format} onChange={(e) => setFormat(e.target.value)} className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white">
-              {["mp4", "webm", "mp3", "wav"].map((f) => <option key={f} value={f}>{f.toUpperCase()}</option>)}
+            <select
+              value={format}
+              onChange={(e) => setFormat(e.target.value)}
+              className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
+            >
+              {["mp4", "webm", "mp3", "wav"].map((f) => (
+                <option key={f} value={f}>{f.toUpperCase()}</option>
+              ))}
             </select>
           </label>
         </div>
+
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <label className="text-xs text-slate-400">
+            <span className="inline-flex items-center gap-1"><Scissors className="w-3 h-3" /> Trim start (optional)</span>
+            <input
+              value={trimStart}
+              onChange={(e) => setTrimStart(e.target.value)}
+              placeholder="01:15"
+              className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
+            />
+          </label>
+          <label className="text-xs text-slate-400">
+            <span className="inline-flex items-center gap-1"><Scissors className="w-3 h-3" /> Trim end (optional)</span>
+            <input
+              value={trimEnd}
+              onChange={(e) => setTrimEnd(e.target.value)}
+              placeholder="02:30"
+              className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
+            />
+          </label>
+        </div>
+        {trimErr && <p className="mt-1.5 text-xs text-red-300">{trimErr}</p>}
+
         <div className="mt-3 space-y-2 text-xs text-slate-300">
           <label className="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" checked={subtitles} onChange={(e) => setSubtitles(e.target.checked)} className="rounded accent-violet-500" />
+            <input
+              type="checkbox"
+              checked={subtitles}
+              onChange={(e) => setSubtitles(e.target.checked)}
+              className="rounded accent-violet-500"
+            />
             Generate subtitles (.SRT)
           </label>
           <label className="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" checked={summary} onChange={(e) => setSummary(e.target.checked)} className="rounded accent-violet-500" />
+            <input
+              type="checkbox"
+              checked={summary}
+              onChange={(e) => setSummary(e.target.checked)}
+              className="rounded accent-violet-500"
+            />
             Generate AI summary
           </label>
         </div>
 
         {error && (
           <div className="mt-3 flex items-center gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-            <AlertCircle className="w-4 h-4" /> {error}
+            <AlertCircle className="w-4 h-4 shrink-0" /> {error}
           </div>
         )}
         {result && (
-          <div className="mt-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">{result}</div>
+          <div className="mt-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
+            {result}
+          </div>
         )}
 
         <button
+          type="button"
           onClick={submit}
-          disabled={loading || !validUrls.length}
+          disabled={loading || !validUrls.length || Boolean(trimErr)}
           className="mt-4 w-full rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40 transition inline-flex items-center justify-center gap-2"
         >
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Layers className="w-4 h-4" />}

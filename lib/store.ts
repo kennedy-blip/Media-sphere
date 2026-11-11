@@ -47,8 +47,9 @@ export const useStore = create<MediaStore>((set, get) => ({
     }
   },
   recordHistory: async (job) => {
+    if (get().history.some((h) => h.jobId === job.id)) return;
     const record: HistoryRecord = {
-      id: `${job.id}-${Date.now()}`,
+      id: job.id,
       jobId: job.id,
       url: job.url,
       sanitizedUrl: job.sanitized_url,
@@ -66,7 +67,9 @@ export const useStore = create<MediaStore>((set, get) => ({
     };
     try {
       await addHistory(record);
-      set({ history: [record, ...get().history] });
+      set((s) => ({
+        history: [record, ...s.history.filter((h) => h.jobId !== job.id)],
+      }));
     } catch {
       /* ignore */
     }

@@ -10,11 +10,22 @@ const nextConfig = {
     ],
   },
   async rewrites() {
-    const api = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-    return [
-      { source: "/api/:path*", destination: `${api}/api/:path*` },
-      { source: "/ws/:path*", destination: `${api}/ws/:path*` },
-    ];
+    const backendUrl = (
+      process.env.API_PROXY_TARGET ||
+      process.env.BACKEND_URL ||
+      (!process.env.VERCEL ? "http://127.0.0.1:8000" : "")
+    ).replace(/\/+$/, "");
+
+    if (!backendUrl) {
+      return [];
+    }
+
+    return {
+      beforeFiles: [
+        { source: "/api/v1/:path*", destination: `${backendUrl}/api/v1/:path*` },
+        { source: "/ws/:path*", destination: `${backendUrl}/ws/:path*` },
+      ],
+    };
   },
 };
 

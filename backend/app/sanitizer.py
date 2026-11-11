@@ -17,26 +17,26 @@ TRACKING_PARAMS = {
     "s", "sc", "sp", "shem", "share", "sharer", "mkt_tok",
 }
 
-# Strict whitelist regex — canonical hostnames
+# Strict whitelist regex — canonical & mobile/shortener hostnames
 WHITELIST_PATTERNS = [
-    r"^(www\.)?youtube\.com$",
-    r"^(www\.)?youtu\.be$",
-    r"^(www\.)?tiktok\.com$",
-    r"^(www\.)?instagram\.com$",
-    r"^(www\.)?x\.com$",
-    r"^(www\.)?twitter\.com$",
-    r"^(www\.)?reddit\.com$",
-    r"^(www\.)?pinterest\.com$",
-    r"^(www\.)?vimeo\.com$",
-    r"^(www\.)?twitch\.tv$",
-    r"^(www\.)?facebook\.com$",
-    r"^(www\.)?linkedin\.com$",
-    r"^(www\.)?m\.youtube\.com$",
-    r"^(www\.)?vm\.tiktok\.com$",
-    r"^(www\.)?vt\.tiktok\.com$",
+    r"^(?:www\.|m\.)?youtube\.com$",
+    r"^(?:www\.)?youtu\.be$",
+    r"^(?:www\.|m\.|vm\.|vt\.)?tiktok\.com$",
+    r"^(?:www\.)?instagram\.com$",
+    r"^(?:www\.|mobile\.)?x\.com$",
+    r"^(?:www\.|mobile\.)?twitter\.com$",
+    r"^(?:www\.|old\.)?reddit\.com$",
+    r"^(?:www\.)?redd\.it$",
+    r"^(?:www\.)?pinterest\.com$",
+    r"^(?:www\.)?pin\.it$",
+    r"^(?:www\.)?vimeo\.com$",
+    r"^(?:www\.|clips\.)?twitch\.tv$",
+    r"^(?:www\.|m\.|fb\.)?facebook\.com$",
+    r"^(?:www\.)?fb\.watch$",
+    r"^(?:www\.)?linkedin\.com$",
 ]
 
-WHITELIST_REGEX = re.compile("|".join(f"(?:{p})" for p in WHITELIST_PATTERNS))
+WHITELIST_REGEX = re.compile("|".join(f"(?:{p})" for p in WHITELIST_PATTERNS), re.IGNORECASE)
 
 # Blocked IP ranges / hosts for SSRF protection
 BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "metadata"}
@@ -67,14 +67,44 @@ def strip_tracking_params(url: str) -> str:
 
 
 def is_blocked_ip(host: str) -> bool:
-    """Check if host is a blocked IP literal."""
-    if host in BLOCKED_IPS or host in BLOCKED_HOSTS:
+    """Check if host is a blocked IP literal or internal metadata host."""
+    clean = host.strip("[]").lower()
+    if clean in BLOCKED_IPS or clean in BLOCKED_HOSTS:
         return True
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(clean)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_reserved:
+            return True
         return any(ip in net for net in BLOCKED_IP_RANGES)
     except ValueError:
         return False
+
+
+def detect_platform(host: str) -> str:
+    h = host.lower().strip(".")
+    for prefix in ("www.", "m.", "mobile.", "old.", "clips.", "fb."):
+        while h.startswith(prefix):
+            h = h[len(prefix):]
+    mapping = {
+        "youtube.com": "youtube",
+        "youtu.be": "youtube",
+        "tiktok.com": "tiktok",
+        "vm.tiktok.com": "tiktok",
+        "vt.tiktok.com": "tiktok",
+        "instagram.com": "instagram",
+        "x.com": "x",
+        "twitter.com": "x",
+        "reddit.com": "reddit",
+        "redd.it": "reddit",
+        "pinterest.com": "pinterest",
+        "pin.it": "pinterest",
+        "vimeo.com": "vimeo",
+        "twitch.tv": "twitch",
+        "facebook.com": "facebook",
+        "fb.watch": "facebook",
+        "linkedin.com": "linkedin",
+    }
+    return mapping.get(h, "unknown")
 
 
 def validate_url(raw_url: str) -> dict:
@@ -86,10 +116,13 @@ def validate_url(raw_url: str) -> dict:
         return {"valid": False, "sanitized_url": None, "platform": None, "error": "Empty URL"}
 
     url = raw_url.strip()
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return {"valid": False, "sanitized_url": None, "platform": None, "error": "Invalid URL format"}
 
     # Stage 1: protocol check — https only
-    if parsed.scheme != "https":
+    if parsed.scheme.lower() != "https":
         return {"valid": False, "sanitized_url": None, "platform": None,
                 "error": "Only https:// URLs are allowed"}
 
@@ -97,7 +130,7 @@ def validate_url(raw_url: str) -> dict:
     if not host:
         return {"valid": False, "sanitized_url": None, "platform": None, "error": "Missing hostname"}
 
-    # Stage 2a: SSRF — block IP literals in private ranges
+    # Stage 2a: SSRF — block IP literals in private/loopback/metadata ranges
     if is_blocked_ip(host):
         return {"valid": False, "sanitized_url": None, "platform": None,
                 "error": "URL resolves to a blocked internal address (SSRF protection)"}
@@ -112,31 +145,9 @@ def validate_url(raw_url: str) -> dict:
     return {"valid": True, "sanitized_url": sanitized, "platform": platform, "error": None}
 
 
-def detect_platform(host: str) -> str:
-    host = host.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    elif host.startswith("m."):
-        host = host[2:]
-    mapping = {
-        "youtube.com": "youtube", "youtu.be": "youtube",
-        "tiktok.com": "tiktok", "vm.tiktok.com": "tiktok", "vt.tiktok.com": "tiktok",
-        "instagram.com": "instagram",
-        "x.com": "x", "twitter.com": "x",
-        "reddit.com": "reddit",
-        "pinterest.com": "pinterest",
-        "vimeo.com": "vimeo",
-        "twitch.tv": "twitch",
-        "facebook.com": "facebook",
-        "linkedin.com": "linkedin",
-    }
-    return mapping.get(host, "unknown")
-
-
 def parse_batch_input(text: str) -> list[str]:
     """Parse comma-separated or newline-separated bulk URL input."""
     if not text:
         return []
-    # Split on newlines and commas
     parts = re.split(r"[\n,]+", text)
     return [p.strip() for p in parts if p.strip()]

@@ -7,48 +7,47 @@ Strict URL sandboxing · client-side tracking removal · background job queues �
 ## Architecture
 
 ```
-[ Next.js 15 Frontend ] ──(WSS progress)──┐
-        │ (POST /api/v1/extract)          │
-        ▼                                 │
-[ FastAPI Gateway ] ──────────────────────┤
-        │ (Dispatch Job)                  │
-        ▼                                 │
-[ Redis Broker ] ─────────────────────────┤
-        │ (Consume Job)                   │
-        ▼                                 │
-[ Celery / Thread Workers ] ──────────────┘
+[ Next.js 15 Frontend ] ──(WS/WSS progress)─┐
+        │ (POST /api/v1/extract)            │
+        ▼                                   │
+[ FastAPI Gateway ] ────────────────────────┤
+        │ (Dispatch Job)                    │
+        ▼                                   │
+[ Redis Broker ] ───────────────────────────┤
+        │ (Consume Job)                     │
+        ▼                                   │
+[ Celery / Thread Workers ] ────────────────┘
   ├── Link Sanitizer & SSRF Sandbox
   ├── yt-dlp Extractor
   ├── FFmpeg Pipeline (trim / convert)
   └── Faster-Whisper AI Engine
         │
         ▼
-[ Ephemeral Storage / S3 ]
+[ Ephemeral Storage (15m TTL) / S3 ]
 ```
 
 ## Quick start (local dev)
 
-### Backend
+### 1. Backend (FastAPI)
 
 ```bash
-cd backend
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+pip install -r backend/requirements.txt
+cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API docs: http://localhost:8000/docs · Health: http://localhost:8000/api/v1/health
 
-### Frontend
+### 2. Frontend (Next.js 15)
 
 ```bash
 npm install
-NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
+npm run dev
 ```
 
-Open http://localhost:3000
+Open http://localhost:3000 (`next.config.js` automatically proxies `/api/v1/*` and `/ws/*` to `API_PROXY_TARGET`, defaulting to `http://127.0.0.1:8000`).
 
-### Full stack (Docker)
+### 3. Full stack (Docker Compose)
 
 ```bash
 docker compose up --build
@@ -56,50 +55,43 @@ docker compose up --build
 
 - Web: http://localhost:3000
 - API: http://localhost:8000/docs
-- Redis: localhost:6379
+- Celery Worker: `celery -A app.celery_app worker`
+- Redis: `localhost:6379`
+
+### 4. Vercel deployment
+
+Importing this repository into Vercel works out of the box:
+- **With external FastAPI backend**: set `API_PROXY_TARGET=https://your-api-host.example.com` in Vercel project environment variables.
+- **Standalone zero-config preview**: when deployed on Vercel without `API_PROXY_TARGET`, built-in Next.js App Router `/api/v1/*` serverless fallback routes handle URL sanitization, SSRF validation, preview extraction, job lifecycle, transcripts/SRT, and downloads automatically.
+
+## Running tests
+
+```bash
+# Backend unit + API lifecycle tests
+.venv/bin/python -m unittest discover -s backend/tests -v
+
+# Frontend TypeScript & production build check
+npx tsc --noEmit && npm run build
+```
 
 ## API reference
 
 | Method | Endpoint | Description |
 |---|---|---|
+| GET | `/api/v1/health` | Service health check |
 | POST | `/api/v1/extract` | Sanitize + return preview cards |
 | POST | `/api/v1/jobs` | Dispatch single processing job |
 | POST | `/api/v1/batch` | Dispatch batch jobs (max 20) |
-| GET | `/api/v1/jobs` | List jobs |
-| GET | `/api/v1/jobs/{id}` | Job detail (+ transcript) |
-| DELETE | `/api/v1/jobs/{id}` | Cancel job |
-| GET | `/api/v1/jobs/{id}/download` | Download finished file |
+| GET | `/api/v1/jobs` | List jobs (including transcripts) |
+| GET | `/api/v1/jobs/{id}` | Job detail (+ transcript/SRT) |
+| DELETE | `/api/v1/jobs/{id}` | Cancel active job |
+| GET | `/api/v1/jobs/{id}/download` | Stream or download (`?download=true`) finished file |
 | GET | `/api/v1/jobs/{id}/transcript` | Transcript / summary / SRT |
-| WS | `/ws/queue` | Live job progress (200ms pushes) |
+| WS | `/ws/queue` | Multi-subscriber live job progress + 2s heartbeat |
 
 ## Security (Module A)
 
-- Strips tracking vectors: `utm_*`, `igsh`, `si`, `fbclid`, `t`, `ref_src`, `feature`, `is_from_webapp`, `sender_device`, …
-- `https://` only
-- Strict whitelist regex: youtube.com, youtu.be, tiktok.com, instagram.com, x.com, twitter.com, reddit.com, pinterest.com, vimeo.com, twitch.tv, facebook.com, linkedin.com
-- Blocks SSRF ranges: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, metadata IP
-
-## Processing (Module C)
-
-- Trim: `ffmpeg -ss -to -c copy` (stream-copy) with frame-accurate transcode fallback
-- Convert: MP4 / WebM / MP3 / WAV
-- AI: Faster-Whisper (`small`/`large-v3`) → `.srt`, raw transcript, key-point summary
-- Storage: ephemeral disk with 15-min TTL cleanup (`processor.cleanup_old_files`, run via CRON)
-
-## Frontend tabs
-
-1. **Extraction Workspace** — paste bar, auto-paste, instant Green/Red validation badges, resolution/format/trim/AI controls, preview grid
-2. **Active Downloads** — live queue board (Queued → Extracting → Trimming → Transcribing → Ready), % bars, MB/s, ETA, cancel
-3. **Completed** — card grid with HTML5 players, Save File, Drive/Dropbox export, Copy Transcript, .SRT download
-4. **History & Collections** — IndexedDB table, platform filter chips, search, re-extract
-
-## End-to-end scenario
-
-Paste 3 URLs (YouTube + TikTok + Instagram with tracking params) → frontend sanitizer cleans them instantly → `POST /api/v1/extract` returns preview cards → pick 1080p MP4 + trim 01:15–02:30 + AI on → jobs #101–103 dispatched → WSS pushes live progress → Completed tab shows players + transcript drawer → Save to Device + IndexedDB history entry with platform badges.
-
-## Tech stack
-
-- Frontend: Next.js 15, React 19, Tailwind CSS, Lucide, Zustand, native WebSocket (+ socket.io-client dep)
-- Backend: FastAPI, Pydantic v2
-- Queue: Redis 7 + Celery 5 (thread fallback when Redis unavailable)
-- Media/AI: yt-dlp, FFmpeg 6+, Faster-Whisper
+- Strips tracking vectors: `utm_*`, `igsh`, `si`, `fbclid`, `t`, `ref_src`, `feature`, `is_from_webapp`, `sender_device`, `gclid`, `msclkid`, `yclid`, …
+- Enforces `https://` only
+- Strict whitelist regex across canonical, mobile (`m.`, `mobile.`, `old.`), and short-link (`youtu.be`, `vm.tiktok.com`, `vt.tiktok.com`, `pin.it`, `redd.it`, `fb.watch`) domains
+- Blocks IPv4 & IPv6 SSRF ranges: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`, `fc00::/7`, `fe80::/10`, cloud metadata IPs

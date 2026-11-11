@@ -2,14 +2,20 @@
 import { useMemo, useState } from "react";
 import {
   ClipboardPaste, Link2, ShieldCheck, ShieldAlert, Sparkles, Scissors,
-  FileVideo, FileAudio, Layers, Loader2, Plus, X, CheckCircle2, AlertCircle,
+  FileVideo, FileAudio, Layers, Loader2, Plus, X, CheckCircle2, AlertCircle, Wand2,
 } from "lucide-react";
-import { api, formatCount, formatDuration, type Preview } from "@/lib/api";
+import { api, formatCount, formatDuration, validateTrimRange, type Preview } from "@/lib/api";
 import { validateUrl, parseBatchInput } from "@/lib/sanitizer";
 import { useStore } from "@/lib/store";
 
-const RESOLUTIONS = ["1080p", "720p", "480p", "360p", "best", "audio"];
+const RESOLUTIONS = ["2160p", "1080p", "720p", "480p", "360p", "best", "audio"];
 const FORMATS = ["mp4", "webm", "mp3", "wav"] as const;
+
+const SAMPLE_URLS = [
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=shared&utm_source=twitter",
+  "https://www.tiktok.com/@techbrand/video/7345678901234?is_from_webapp=1&sender_device=pc",
+  "https://www.instagram.com/reel/C3xY9z0A1bC/?igsh=MZRlODBiNWFlZA==",
+].join("\n");
 
 const PLATFORM_COLORS: Record<string, string> = {
   youtube: "bg-red-500/15 text-red-300 border-red-500/30",
@@ -24,26 +30,38 @@ const PLATFORM_COLORS: Record<string, string> = {
   linkedin: "bg-blue-700/15 text-blue-300 border-blue-700/30",
 };
 
+interface CardSelection {
+  resolution: string;
+  format: string;
+  trimStart: string;
+  trimEnd: string;
+  subtitles: boolean;
+  summary: boolean;
+}
+
+const DEFAULT_SELECTION: CardSelection = {
+  resolution: "1080p",
+  format: "mp4",
+  trimStart: "",
+  trimEnd: "",
+  subtitles: true,
+  summary: true,
+};
+
 export default function ExtractionWorkspace() {
-  const { previews, setPreviews, setTab, setBatchOpen } = useStore();
+  const { previews, setPreviews, upsertJob, setTab, setBatchOpen } = useStore();
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [dispatching, setDispatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Per-preview selection state
-  const [selections, setSelections] = useState<Record<string, {
-    resolution: string; format: string; trimStart: string; trimEnd: string;
-    subtitles: boolean; summary: boolean;
-  }>>({});
+  const [selections, setSelections] = useState<Record<string, CardSelection>>({});
 
   const urls = useMemo(() => parseBatchInput(input), [input]);
   const validation = useMemo(() => {
     if (!input.trim()) return null;
-    const results = urls.map((u) => ({ url: u, ...validateUrl(u) }));
-    return results;
+    return urls.map((u) => ({ url: u, ...validateUrl(u) }));
   }, [input, urls]);
 
-  const allValid = validation ? validation.every((v) => v.valid) : false;
   const validCount = validation ? validation.filter((v) => v.valid).length : 0;
 
   async function pasteFromClipboard() {
@@ -51,24 +69,29 @@ export default function ExtractionWorkspace() {
       const text = await navigator.clipboard.readText();
       setInput((prev) => (prev ? prev + "\n" + text : text));
     } catch {
-      setError("Clipboard access denied — paste manually with Ctrl+V");
+      setError("Clipboard access denied — paste manually with Ctrl+V / Cmd+V");
     }
+  }
+
+  function loadDemoBatch() {
+    setInput(SAMPLE_URLS);
+    setError(null);
   }
 
   async function handleExtract() {
     if (!urls.length) return;
+    if (urls.length > 20) {
+      setError("Maximum 20 URLs per batch");
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
       const data = await api.extract(urls);
       setPreviews(data.previews);
-      // init selections
-      const init: typeof selections = {};
+      const init: Record<string, CardSelection> = {};
       data.previews.forEach((p) => {
-        init[p.sanitized_url] = {
-          resolution: "1080p", format: "mp4", trimStart: "", trimEnd: "",
-          subtitles: true, summary: true,
-        };
+        init[p.sanitized_url] = { ...DEFAULT_SELECTION };
       });
       setSelections(init);
     } catch (e) {
@@ -79,56 +102,97 @@ export default function ExtractionWorkspace() {
   }
 
   async function dispatchJob(preview: Preview) {
-    const sel = selections[preview.sanitized_url];
-    if (!sel) return;
+    const sel = selections[preview.sanitized_url] ?? DEFAULT_SELECTION;
+    const trimErr = validateTrimRange(sel.trimStart, sel.trimEnd);
+    if (trimErr) {
+      setError(trimErr);
+      return;
+    }
+    setError(null);
+    setDispatching(true);
     try {
-      await api.createJob({
+      const job = await api.createJob({
         url: preview.sanitized_url,
         resolution: sel.resolution,
         format: sel.format,
-        trim_start: sel.trimStart || null,
-        trim_end: sel.trimEnd || null,
+        trim_start: sel.trimStart.trim() || null,
+        trim_end: sel.trimEnd.trim() || null,
         generate_subtitles: sel.subtitles,
         generate_summary: sel.summary,
       });
+      upsertJob(job);
       setTab("active");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to dispatch job");
+    } finally {
+      setDispatching(false);
     }
   }
 
   async function dispatchAll() {
     const valid = previews.filter((p) => p.valid);
     if (!valid.length) return;
+    for (const p of valid) {
+      const sel = selections[p.sanitized_url] ?? DEFAULT_SELECTION;
+      const trimErr = validateTrimRange(sel.trimStart, sel.trimEnd);
+      if (trimErr) {
+        setError(`${p.title ?? p.platform}: ${trimErr}`);
+        return;
+      }
+    }
+    setError(null);
+    setDispatching(true);
     try {
-      await api.createBatch({
-        urls: valid.map((p) => p.sanitized_url),
-        resolution: "1080p",
-        format: "mp4",
-        generate_subtitles: true,
-        generate_summary: true,
-      });
+      const created = await Promise.all(
+        valid.map((p) => {
+          const sel = selections[p.sanitized_url] ?? DEFAULT_SELECTION;
+          return api.createJob({
+            url: p.sanitized_url,
+            resolution: sel.resolution,
+            format: sel.format,
+            trim_start: sel.trimStart.trim() || null,
+            trim_end: sel.trimEnd.trim() || null,
+            generate_subtitles: sel.subtitles,
+            generate_summary: sel.summary,
+          });
+        })
+      );
+      created.forEach((j) => upsertJob(j));
       setTab("active");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Batch dispatch failed");
+    } finally {
+      setDispatching(false);
     }
   }
 
-  function updateSel(key: string, patch: Partial<NonNullable<typeof selections[string]>>) {
-    setSelections((s) => ({ ...s, [key]: { ...s[key], ...patch } }));
+  function updateSel(key: string, patch: Partial<CardSelection>) {
+    setSelections((s) => ({
+      ...s,
+      [key]: { ...(s[key] ?? DEFAULT_SELECTION), ...patch },
+    }));
   }
 
   return (
     <div className="space-y-6">
       {/* Paste bar */}
       <div className="rounded-2xl border border-white/10 bg-panel p-5">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
           <h2 className="text-sm font-semibold text-white flex items-center gap-2">
             <Link2 className="w-4 h-4 text-accent" /> Paste media URLs
           </h2>
-          <span className="text-xs text-slate-400">Tracking params auto-stripped · SSRF sandbox active</span>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={loadDemoBatch}
+              className="inline-flex items-center gap-1.5 text-xs text-accent hover:text-accent/80 transition"
+            >
+              <Wand2 className="w-3.5 h-3.5" /> Load 3-platform sample
+            </button>
+            <span className="text-xs text-slate-400">Tracking params auto-stripped · SSRF sandbox active</span>
+          </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-col sm:flex-row gap-2">
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -136,16 +200,18 @@ export default function ExtractionWorkspace() {
             rows={4}
             className="flex-1 rounded-xl bg-ink border border-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-accent/60 resize-y"
           />
-          <div className="flex flex-col gap-2">
+          <div className="flex sm:flex-col gap-2">
             <button
+              type="button"
               onClick={pasteFromClipboard}
-              className="flex items-center gap-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 px-4 py-2.5 text-sm text-slate-200 transition"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 px-4 py-2.5 text-sm text-slate-200 transition"
             >
               <ClipboardPaste className="w-4 h-4" /> Auto-paste
             </button>
             <button
+              type="button"
               onClick={() => setBatchOpen(true)}
-              className="flex items-center gap-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 px-4 py-2.5 text-sm text-slate-200 transition"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 px-4 py-2.5 text-sm text-slate-200 transition"
             >
               <Plus className="w-4 h-4" /> Batch drawer
             </button>
@@ -172,8 +238,9 @@ export default function ExtractionWorkspace() {
           </div>
         )}
 
-        <div className="mt-4 flex items-center gap-3">
+        <div className="mt-4 flex flex-wrap items-center gap-3">
           <button
+            type="button"
             onClick={handleExtract}
             disabled={loading || !urls.length}
             className="inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40 transition"
@@ -187,7 +254,7 @@ export default function ExtractionWorkspace() {
         </div>
         {error && (
           <div className="mt-3 flex items-center gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-            <AlertCircle className="w-4 h-4" /> {error}
+            <AlertCircle className="w-4 h-4 shrink-0" /> {error}
           </div>
         )}
       </div>
@@ -199,18 +266,24 @@ export default function ExtractionWorkspace() {
             <h3 className="text-sm font-semibold text-white">
               Preview cards ({previews.filter((p) => p.valid).length}/{previews.length} valid)
             </h3>
-            <button
-              onClick={dispatchAll}
-              className="rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 px-3 py-1.5 text-xs text-slate-200 transition"
-            >
-              Dispatch all as jobs
-            </button>
+            {previews.some((p) => p.valid) && (
+              <button
+                type="button"
+                onClick={dispatchAll}
+                disabled={dispatching}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-accent/15 hover:bg-accent/25 border border-accent/40 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40 transition"
+              >
+                {dispatching && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                Dispatch all valid ({previews.filter((p) => p.valid).length})
+              </button>
+            )}
           </div>
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {previews.map((p, i) => {
-              const sel = selections[p.sanitized_url];
+              const sel = selections[p.sanitized_url] ?? DEFAULT_SELECTION;
+              const trimErr = validateTrimRange(sel.trimStart, sel.trimEnd);
               return (
-                <article key={i} className="overflow-hidden rounded-2xl border border-white/10 bg-panel">
+                <article key={`${p.sanitized_url}-${i}`} className="overflow-hidden rounded-2xl border border-white/10 bg-panel">
                   {p.thumbnail ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={p.thumbnail} alt={p.title ?? "thumbnail"} className="h-40 w-full object-cover" />
@@ -221,30 +294,36 @@ export default function ExtractionWorkspace() {
                   )}
                   <div className="p-4 space-y-3">
                     <div className="flex items-start justify-between gap-2">
-                      <h4 className="text-sm font-semibold text-white leading-snug">{p.title ?? "Untitled"}</h4>
+                      <h4 className="text-sm font-semibold text-white leading-snug">{p.title ?? "Blocked / Invalid URL"}</h4>
                       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] capitalize ${PLATFORM_COLORS[p.platform] ?? "bg-white/5 text-slate-300 border-white/10"}`}>
                         {p.platform}
                       </span>
                     </div>
                     <p className="text-xs text-slate-400 line-clamp-2">{p.description ?? p.error ?? ""}</p>
-                    <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
-                      <span>{p.creator ?? "—"}</span>
-                      <span>{formatCount(p.views)} views</span>
-                      <span>{formatDuration(p.duration)}</span>
-                    </div>
+                    {p.valid && (
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
+                        <span>{p.creator ?? "—"}</span>
+                        <span>{formatCount(p.views)} views</span>
+                        <span>{formatDuration(p.duration)}</span>
+                      </div>
+                    )}
                     <p className="truncate text-[11px] text-slate-500" title={p.sanitized_url}>{p.sanitized_url}</p>
 
-                    {p.valid && sel && (
+                    {p.valid && (
                       <div className="space-y-3 border-t border-white/5 pt-3">
                         <div className="grid grid-cols-2 gap-2">
                           <label className="text-xs text-slate-400">
                             Resolution
                             <select
                               value={sel.resolution}
-                              onChange={(e) => updateSel(p.sanitized_url, { resolution: e.target.value })}
+                              onChange={(e) => {
+                                const res = e.target.value;
+                                const nextFmt = res === "audio" && !["mp3", "wav"].includes(sel.format) ? "mp3" : sel.format;
+                                updateSel(p.sanitized_url, { resolution: res, format: nextFmt });
+                              }}
                               className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
                             >
-                              {RESOLUTIONS.map((r) => <option key={r} value={r}>{r}</option>)}
+                              {RESOLUTIONS.map((r) => <option key={r} value={r}>{r === "2160p" ? "4K (2160p)" : r}</option>)}
                             </select>
                           </label>
                           <label className="text-xs text-slate-400">
@@ -259,37 +338,53 @@ export default function ExtractionWorkspace() {
                           </label>
                         </div>
                         <div className="grid grid-cols-2 gap-2">
-                          <label className="text-xs text-slate-400 flex items-center gap-1.5">
-                            <Scissors className="w-3.5 h-3.5" /> Start
+                          <label className="text-xs text-slate-400">
+                            <span className="inline-flex items-center gap-1"><Scissors className="w-3 h-3" /> Trim start</span>
                             <input
                               value={sel.trimStart}
                               onChange={(e) => updateSel(p.sanitized_url, { trimStart: e.target.value })}
                               placeholder="01:15"
-                              className="w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
+                              className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
                             />
                           </label>
-                          <label className="text-xs text-slate-400 flex items-center gap-1.5">
-                            <Scissors className="w-3.5 h-3.5" /> End
+                          <label className="text-xs text-slate-400">
+                            <span className="inline-flex items-center gap-1"><Scissors className="w-3 h-3" /> Trim end</span>
                             <input
                               value={sel.trimEnd}
                               onChange={(e) => updateSel(p.sanitized_url, { trimEnd: e.target.value })}
                               placeholder="02:30"
-                              className="w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
+                              className="mt-1 w-full rounded-lg bg-ink border border-white/10 px-2 py-2 text-xs text-white"
                             />
                           </label>
                         </div>
-                        <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={sel.subtitles}
-                            onChange={(e) => updateSel(p.sanitized_url, { subtitles: e.target.checked })}
-                            className="rounded accent-violet-500"
-                          />
-                          <Sparkles className="w-3.5 h-3.5 text-accent" /> Generate subtitles &amp; summary
-                        </label>
+                        {trimErr && (
+                          <p className="text-[11px] text-red-300">{trimErr}</p>
+                        )}
+                        <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-300">
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={sel.subtitles}
+                              onChange={(e) => updateSel(p.sanitized_url, { subtitles: e.target.checked })}
+                              className="rounded accent-violet-500"
+                            />
+                            <Sparkles className="w-3.5 h-3.5 text-accent" /> Subtitles (.SRT)
+                          </label>
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={sel.summary}
+                              onChange={(e) => updateSel(p.sanitized_url, { summary: e.target.checked })}
+                              className="rounded accent-violet-500"
+                            />
+                            AI Summary
+                          </label>
+                        </div>
                         <button
+                          type="button"
                           onClick={() => dispatchJob(p)}
-                          className="w-full rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white hover:bg-accent/90 transition"
+                          disabled={dispatching || Boolean(trimErr)}
+                          className="w-full rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40 transition"
                         >
                           Extract &amp; process
                         </button>
@@ -297,7 +392,7 @@ export default function ExtractionWorkspace() {
                     )}
                     {!p.valid && (
                       <div className="flex items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs text-red-300">
-                        <X className="w-3.5 h-3.5" /> {p.error}
+                        <X className="w-3.5 h-3.5 shrink-0" /> {p.error}
                       </div>
                     )}
                   </div>
@@ -310,7 +405,7 @@ export default function ExtractionWorkspace() {
 
       {/* Format legend */}
       <div className="flex flex-wrap gap-4 text-xs text-slate-500">
-        <span className="inline-flex items-center gap-1.5"><FileVideo className="w-3.5 h-3.5" /> Video: 1080p / 720p / 4K / 8K → MP4 · WebM</span>
+        <span className="inline-flex items-center gap-1.5"><FileVideo className="w-3.5 h-3.5" /> Video: 4K / 1080p / 720p / 480p / 360p → MP4 · WebM</span>
         <span className="inline-flex items-center gap-1.5"><FileAudio className="w-3.5 h-3.5" /> Audio: 128 / 320 kbps → MP3 · WAV</span>
         <span className="inline-flex items-center gap-1.5"><CheckCircle2 className="w-3.5 h-3.5" /> Whitelisted: YouTube, TikTok, Instagram, X, Reddit, Pinterest, Vimeo, Twitch, Facebook, LinkedIn</span>
       </div>

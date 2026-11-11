@@ -1,16 +1,17 @@
 "use client";
 import { useEffect, useMemo, useState } from "react";
-import { History, Search, Trash2, RotateCcw, Filter } from "lucide-react";
+import { History, Search, Trash2, RotateCcw, Filter, AlertCircle } from "lucide-react";
 import { api } from "@/lib/api";
 import { useStore } from "@/lib/store";
-import { deleteHistory, clearHistory } from "@/lib/indexeddb";
+import { deleteHistory, clearHistory, type HistoryRecord } from "@/lib/indexeddb";
 
 const PLATFORMS = ["all", "youtube", "tiktok", "instagram", "x", "reddit", "pinterest", "vimeo", "twitch", "facebook", "linkedin"];
 
 export default function HistoryLog() {
-  const { history, loadHistory, setTab } = useStore();
+  const { history, loadHistory, upsertJob, setTab } = useStore();
   const [query, setQuery] = useState("");
   const [platform, setPlatform] = useState("all");
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     loadHistory();
@@ -25,15 +26,22 @@ export default function HistoryLog() {
     });
   }, [history, query, platform]);
 
-  async function reExtract(url: string) {
+  async function reExtract(r: HistoryRecord) {
+    setError(null);
     try {
-      await api.createJob({
-        url, resolution: "1080p", format: "mp4",
-        generate_subtitles: true, generate_summary: true,
+      const job = await api.createJob({
+        url: r.sanitizedUrl,
+        resolution: r.resolution || "1080p",
+        format: r.format || "mp4",
+        trim_start: r.trimStart ?? null,
+        trim_end: r.trimEnd ?? null,
+        generate_subtitles: true,
+        generate_summary: true,
       });
+      upsertJob(job);
       setTab("active");
-    } catch {
-      /* surface via toast in future */
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to re-extract item");
     }
   }
 
@@ -55,12 +63,19 @@ export default function HistoryLog() {
           <span className="text-xs font-normal text-slate-500">Stored locally in IndexedDB · no account needed</span>
         </h2>
         <button
+          type="button"
           onClick={clearAll}
           className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/20 transition"
         >
           <Trash2 className="w-3.5 h-3.5" /> Clear all
         </button>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+          <AlertCircle className="w-4 h-4 shrink-0" /> {error}
+        </div>
+      )}
 
       <div className="flex flex-col gap-3 md:flex-row md:items-center">
         <div className="relative flex-1">
@@ -76,6 +91,7 @@ export default function HistoryLog() {
           <Filter className="w-4 h-4 text-slate-500 mt-2" />
           {PLATFORMS.map((p) => (
             <button
+              type="button"
               key={p}
               onClick={() => setPlatform(p)}
               className={`rounded-full border px-2.5 py-1 text-xs capitalize transition ${
@@ -90,7 +106,7 @@ export default function HistoryLog() {
         </div>
       </div>
 
-      <div className="overflow-hidden rounded-2xl border border-white/10 bg-panel">
+      <div className="overflow-x-auto rounded-2xl border border-white/10 bg-panel">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-white/5 text-left text-xs text-slate-500">
@@ -111,18 +127,25 @@ export default function HistoryLog() {
                 <td className="px-4 py-3">
                   <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] capitalize text-slate-300">{r.platform}</span>
                 </td>
-                <td className="px-4 py-3 text-xs text-slate-400">{r.resolution} · {r.format.toUpperCase()}</td>
+                <td className="px-4 py-3 text-xs text-slate-400">
+                  {r.resolution} · {r.format.toUpperCase()}
+                  {(r.trimStart || r.trimEnd) && (
+                    <div className="text-[11px] text-slate-500">Trim {r.trimStart ?? "00:00"}–{r.trimEnd ?? "end"}</div>
+                  )}
+                </td>
                 <td className="px-4 py-3 text-xs text-slate-400">{new Date(r.createdAt).toLocaleString()}</td>
                 <td className="px-4 py-3 text-right">
                   <div className="inline-flex gap-1.5">
                     <button
-                      onClick={() => reExtract(r.sanitizedUrl)}
+                      type="button"
+                      onClick={() => reExtract(r)}
                       title="Re-extract"
                       className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-white/10 transition"
                     >
                       <RotateCcw className="w-3.5 h-3.5" /> Re-extract
                     </button>
                     <button
+                      type="button"
                       onClick={() => remove(r.id)}
                       title="Delete record"
                       className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-white/10 transition"

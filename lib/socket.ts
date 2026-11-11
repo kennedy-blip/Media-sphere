@@ -1,14 +1,14 @@
 "use client";
-import type { Job } from "./api";
+import { getBrowserApiBase, type Job } from "./api";
 import { useStore } from "./store";
 
 /**
- * Real-time progress via WebSocket (wss://…/ws/queue) with polling fallback.
- * Pushes every 200ms from backend; falls back to 2s polling if WS drops.
+ * Real-time progress via WebSocket (ws/wss://…/ws/queue) with polling fallback.
+ * Pushes every 200ms from backend; falls back to 1.5s polling if WS is unavailable (e.g. serverless).
  */
 export function connectProgressFeed() {
   const { upsertJob, setWsConnected, recordHistory } = useStore.getState();
-  const base = process.env.NEXT_PUBLIC_API_URL || "";
+  const base = getBrowserApiBase();
   const wsUrl = base
     ? base.replace(/^http/, "ws") + "/ws/queue"
     : `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws/queue`;
@@ -17,8 +17,14 @@ export function connectProgressFeed() {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
+  let consecutiveFailures = 0;
 
   const recorded = new Set<string>();
+
+  // Seed recorded set from already-persisted history so page reloads don't duplicate entries
+  for (const h of useStore.getState().history) {
+    recorded.add(h.jobId);
+  }
 
   function handleJob(job: Job) {
     upsertJob(job);
@@ -40,7 +46,7 @@ export function connectProgressFeed() {
       } catch {
         /* backend offline */
       }
-    }, 2000);
+    }, 1500);
   }
 
   function stopPolling() {
@@ -59,6 +65,7 @@ export function connectProgressFeed() {
       return;
     }
     ws.onopen = () => {
+      consecutiveFailures = 0;
       setWsConnected(true);
       stopPolling();
     };
@@ -72,9 +79,11 @@ export function connectProgressFeed() {
     };
     ws.onclose = () => {
       setWsConnected(false);
+      consecutiveFailures += 1;
       if (!closed) {
         startPolling();
-        reconnectTimer = setTimeout(connect, 4000);
+        const delay = Math.min(15000, 3000 * consecutiveFailures);
+        reconnectTimer = setTimeout(connect, delay);
       }
     };
     ws.onerror = () => {

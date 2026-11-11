@@ -5,6 +5,9 @@ dist/
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.tsbuildinfo
+.vercel/
 .env
 .env.local
 /tmp/mediasphere_storage/
