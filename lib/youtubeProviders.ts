@@ -1088,6 +1088,93 @@ export async function resolveViaInnerTubeDirect(
 }
 
 // ============================================================================
+// ENGINE 0: COBALT COMMUNITY FLEET
+// ============================================================================
+
+/**
+ * Cobalt is purpose-built for datacenter/serverless downloaders and returns a
+ * tunnel URL whose bytes are proxied by the instance, avoiding YouTube's AWS
+ * IP bot challenge. Instances are raced because community uptime varies.
+ */
+export async function resolveViaCobalt(
+  videoId: string,
+  wantAudioOnly: boolean,
+  targetHeight: number,
+  signal?: AbortSignal
+): Promise<ResolvedStream> {
+  const instances = [
+    "https://nuko-c.meowing.de",
+    "https://cobalt-backend.canine.tools",
+    "https://cobalt-api.clxxped.lol",
+    "https://subito-c.meowing.de",
+    "https://kityune.imput.net",
+    "https://sunny.imput.net",
+    "https://nachos.imput.net",
+    "https://blossom.imput.net",
+    "https://cobalt-api.meowing.de",
+    "https://capi.3kh0.net",
+  ];
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const quality = String(snapQuality(targetHeight, [2160, 1440, 1080, 720, 480, 360, 240, 144]));
+
+  const attempt = async (base: string): Promise<ResolvedStream> => {
+    const res = await fetch(base, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": DESKTOP_UA,
+      },
+      body: JSON.stringify({
+        url: watchUrl,
+        videoQuality: quality,
+        audioFormat: "mp3",
+        audioBitrate: "128",
+        downloadMode: wantAudioOnly ? "audio" : "auto",
+        youtubeVideoCodec: "h264",
+        filenameStyle: "pretty",
+      }),
+      redirect: "follow",
+      signal: combineSignal(signal, 22000),
+    });
+    const json = (await res.json().catch(() => null)) as {
+      status?: string;
+      url?: string;
+      error?: { code?: string } | string;
+      picker?: Array<{ type?: string; url?: string }>;
+    } | null;
+    if (!res.ok) throw new Error(`${new URL(base).hostname} HTTP ${res.status}`);
+    if (json?.status === "error") {
+      const detail = typeof json.error === "string" ? json.error : json.error?.code;
+      throw new Error(`${new URL(base).hostname}: ${detail || "Cobalt error"}`);
+    }
+    const pickerLink = json?.picker?.find((item) => item.type === "video" && item.url)?.url;
+    const link = json?.url || pickerLink;
+    if (!link) throw new Error(`${new URL(base).hostname} returned no tunnel URL`);
+    const normalized = normalizeHttpUrl(link);
+    const mediaHeaders = { "User-Agent": DESKTOP_UA, Accept: "*/*" };
+    return wantAudioOnly
+      ? { audioUrl: normalized, headers: mediaHeaders, provider: `cobalt:${new URL(base).hostname}` }
+      : { videoUrl: normalized, headers: mediaHeaders, provider: `cobalt:${new URL(base).hostname}:${quality}p` };
+  };
+
+  // Race small groups to get low latency without flooding every public instance.
+  const errors: string[] = [];
+  for (let i = 0; i < instances.length; i += 3) {
+    try {
+      return await Promise.any(instances.slice(i, i + 3).map(attempt));
+    } catch (err) {
+      if (err instanceof AggregateError) {
+        errors.push(...err.errors.map((e) => (e instanceof Error ? e.message : String(e))));
+      } else {
+        errors.push(err instanceof Error ? err.message : String(err));
+      }
+    }
+  }
+  throw new Error(errors.slice(-5).join("; ") || "All Cobalt instances failed");
+}
+
+// ============================================================================
 // ORDERED CANDIDATE LIST FOR DOWNLOAD-TIME FAILOVER
 // ============================================================================
 
@@ -1111,6 +1198,10 @@ export function getYoutubeCandidateResolvers(
   };
 
   return [
+    {
+      name: "Cobalt",
+      resolve: () => resolveViaCobalt(videoId, wantAudioOnly, targetHeight),
+    },
     ...(preferFullHd ? [saveNowEntry, saveTubeEntry] : [saveTubeEntry, saveNowEntry]),
     {
       name: "YTConvert",
