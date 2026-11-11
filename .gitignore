@@ -1,0 +1,12 @@
+node_modules/
+.next/
+out/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+/tmp/mediasphere_storage/
+.DS_Store
+*.log
