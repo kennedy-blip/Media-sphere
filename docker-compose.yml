@@ -1,0 +1,54 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - USE_CELERY=true
+      - MEDIA_STORAGE_DIR=/tmp/mediasphere_storage
+      - CORS_ORIGINS=*
+    depends_on:
+      - redis
+    volumes:
+      - media_storage:/tmp/mediasphere_storage
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - USE_CELERY=true
+      - MEDIA_STORAGE_DIR=/tmp/mediasphere_storage
+    depends_on:
+      - redis
+    volumes:
+      - media_storage:/tmp/mediasphere_storage
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        - API_PROXY_TARGET=http://api:8000
+    ports:
+      - "3000:3000"
+    environment:
+      - API_PROXY_TARGET=http://api:8000
+    depends_on:
+      - api
+
+volumes:
+  redis_data:
+  media_storage:
