@@ -38,7 +38,7 @@ shared media volume             instance-local /tmp media cache
 | `npx tsc --noEmit --incremental false` | Passed |
 | `npm run build` | Passed with Next.js 15.5.29 |
 | Backend `unittest` suite in an isolated Python 3.11 environment | 9 tests passed; lifecycle tests use `MEDIASPHERE_TEST_MOCK=true`, plus a real local FFmpeg trim/conversion smoke test |
-| `npm run lint` | Not a usable CI gate: no ESLint configuration; Next.js prompts interactively |
+| `npm run lint` | Initially not a usable CI gate (no ESLint config; Next.js prompted interactively). Now configured via `eslint.config.mjs` and passing; the one error it surfaced (dead `PipedResponse` interface) was removed. |
 | Serverless cancellation probe with a local cached-file fixture | A cancelled job still resolved through `ensureDownloadableFile` |
 | Serverless stale-snapshot probe | An older `ready` disk snapshot overwrote a newer cancelled state |
 | Serverless option-validation probe | Numeric `resolution` raised `TypeError`, rather than returning the intended validation result |
@@ -62,7 +62,7 @@ Priority describes delivery risk. Status is the repository/project workflow stat
 | H04 | Replace instance-local job coordination with durable atomic state; make cancellation terminal and gate downloads on authorized `ready` state. | High | Todo | Cancelled-download and stale-ready resurrection bugs reproduced locally. Cold-start/restart/concurrent-cancel tests must pass. |
 | H05 | Add request, concurrency, duration, byte, disk, and wall-clock budgets, with bounded queues and cleanup of abandoned work. | High | Todo | A 20-URL batch is not a resource budget; processing timeouts can exceed route budgets. Test overload, expiry, and partial failure. |
 | H06 | Unify request validation and enforce the promised media-processing contract, including trim bounds, FFmpeg availability, container, and resolution behavior. | High | Todo | Non-string input can become HTTP 400; missing backend FFmpeg can silently rename an unprocessed file. Both engines must reject or explicitly report unsupported work. |
-| M01 | Add noninteractive CI for frontend type/build/lint, backend tests, Node route/state tests, and deployment packaging. | Medium | Todo | No `.github/workflows`; lint currently prompts. Required checks must run without live provider credentials. |
+| M01 | Add noninteractive CI for frontend type/build/lint, backend tests, Node route/state tests, and deployment packaging. | Medium | In Progress | ESLint flat config + `.github/workflows/ci.yml` landed (frontend lint/type/build, backend suite, ShellCheck). Still needed: Node route/state tests and Docker packaging checks. |
 | M02 | Make transcript/SRT provenance truthful; distinguish captions, speech-to-text, lyrics, and description fallback, and fix timestamp formatting/windowing. | Medium | Todo | Descriptions/lyrics can be presented as transcripts; fabricated description cues are not speech subtitles; Node has no Whisper path. |
 | M03 | Make batch and “dispatch all” operations preserve per-item options and partial successes, with clear skipped/failed results. | Medium | Todo | `dispatchAll` uses `Promise.all` and can hide created jobs when one request fails; the drawer silently drops invalid URLs before submission. |
 | M04 | Harden browser job recovery and history: restore the current session's pending jobs, merge updates safely, and expose cancel/retry/storage failures. | Medium | Todo | Initial list fetching can race polling; active jobs are not restored from local history; several UI actions swallow errors. |

@@ -72,9 +72,17 @@ Importing this repository into Vercel works out of the box:
 # Backend unit + API lifecycle tests
 .venv/bin/python -m unittest discover -s backend/tests -v
 
-# Frontend TypeScript & production build check
-npx tsc --noEmit && npm run build
+# Frontend lint, TypeScript & production build check
+npm run lint && npm run typecheck && npm run build
+
+# Shell script checks
+bash -n setup_project_board.sh && shellcheck setup_project_board.sh
 ```
+
+These same checks run automatically on every pull request and on pushes to `main`
+via [`.github/workflows/ci.yml`](.github/workflows/ci.yml). CI needs no secrets and
+makes no live provider calls: the backend suite sets `MEDIASPHERE_TEST_MOCK=true`.
+Use `npm run lint:fix` to apply autofixable lint changes locally.
 
 ## API reference
 
