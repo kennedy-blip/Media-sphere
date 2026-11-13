@@ -1,3 +1,4 @@
+import { isBlockedHost } from "./ipPolicy";
 /**
  * Module A (client & serverless): URL Sanitization & Link Sandbox.
  * Mirrors backend/app/sanitizer.py for instant UI & API validation.
@@ -28,25 +29,6 @@ const WHITELIST = [
   /^(?:www\.)?fb\.watch$/i,
   /^(?:www\.)?linkedin\.com$/i,
 ];
-
-const BLOCKED_HOSTS = new Set(["localhost", "metadata.google.internal", "metadata"]);
-const BLOCKED_IPS = new Set(["169.254.169.254", "100.100.100.200", "fd00:ec2::254"]);
-
-function isPrivateIp(rawHost: string): boolean {
-  const host = rawHost.replace(/^\[|\]$/g, "").toLowerCase();
-  if (BLOCKED_HOSTS.has(host) || BLOCKED_IPS.has(host)) return true;
-  if (host === "::1" || host === "::" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) {
-    return true;
-  }
-  const m = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  if (!m) return false;
-  const [a, b] = [parseInt(m[1], 10), parseInt(m[2], 10)];
-  if (a === 127 || a === 10 || a === 0) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 169 && b === 254) return true;
-  return false;
-}
 
 export function extractYoutubeVideoId(rawUrl: string): string | null {
   try {
@@ -150,9 +132,10 @@ export function validateUrl(raw: string): ValidationResult {
   if (parsed.protocol !== "https:") {
     return { valid: false, sanitizedUrl: null, platform: null, error: "Only https:// URLs are allowed" };
   }
+  if (parsed.username || parsed.password) return { valid: false, sanitizedUrl: null, platform: null, error: "URL credentials are not allowed" };
   const host = parsed.hostname.toLowerCase();
   if (!host) return { valid: false, sanitizedUrl: null, platform: null, error: "Missing hostname" };
-  if (isPrivateIp(host)) {
+  if (isBlockedHost(host)) {
     return { valid: false, sanitizedUrl: null, platform: null, error: "Blocked internal address (SSRF protection)" };
   }
   if (!WHITELIST.some((re) => re.test(host))) {

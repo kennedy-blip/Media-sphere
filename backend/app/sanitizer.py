@@ -37,19 +37,11 @@ WHITELIST_PATTERNS = [
 
 WHITELIST_REGEX = re.compile("|".join(f"(?:{p})" for p in WHITELIST_PATTERNS), re.IGNORECASE)
 
-BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "metadata"}
-BLOCKED_IP_RANGES = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fe80::/10"),
-    ipaddress.ip_network("fc00::/7"),
-]
-BLOCKED_IPS = {"169.254.169.254", "100.100.100.200", "fd00:ec2::254"}
+BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata.google.internal", "metadata.goog", "metadata"}
+EXTRA_BLOCKED_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
+    "100.64.0.0/10", "192.0.0.0/24", "192.31.196.0/24", "192.88.99.0/24",
+    "192.175.48.0/24", "198.18.0.0/15", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32",
+))
 
 
 def extract_youtube_video_id(url: str) -> str | None:
@@ -95,14 +87,15 @@ def strip_tracking_params(url: str) -> str:
 
 
 def is_blocked_ip(host: str) -> bool:
-    clean = host.strip("[]").lower()
-    if clean in BLOCKED_IPS or clean in BLOCKED_HOSTS:
+    clean = host.strip("[]").lower().rstrip(".")
+    if not clean or clean in BLOCKED_HOSTS or clean.endswith((".localhost", ".localdomain")):
         return True
     try:
         ip = ipaddress.ip_address(clean)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_reserved:
-            return True
-        return any(ip in net for net in BLOCKED_IP_RANGES)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        return (not ip.is_global or ip.is_multicast or ip.is_reserved
+                or any(ip.version == net.version and ip in net for net in EXTRA_BLOCKED_NETWORKS))
     except ValueError:
         return False
 
@@ -151,6 +144,9 @@ def validate_url(raw_url: str) -> dict:
     if parsed.scheme.lower() != "https":
         return {"valid": False, "sanitized_url": None, "platform": None,
                 "error": "Only https:// URLs are allowed"}
+
+    if parsed.username is not None or parsed.password is not None:
+        return {"valid": False, "sanitized_url": None, "platform": None, "error": "URL credentials are not allowed"}
 
     host = (parsed.hostname or "").lower()
     if not host:

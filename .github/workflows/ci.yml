@@ -33,6 +33,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Outbound security tests
+        run: npm test
+
       - name: Typecheck
         run: npm run typecheck
 

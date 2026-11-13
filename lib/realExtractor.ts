@@ -2,6 +2,7 @@
  * Real-world multi-platform metadata & stream resolver.
  * Supports YouTube, TikTok, Instagram, X/Twitter, Reddit, Pinterest, Vimeo, Twitch, Facebook, LinkedIn.
  */
+import { safeFetch } from "./outboundSecurity";
 import { Client, Ytdl, type VideoInfo } from "@distube/ytdl-core";
 import { extractYoutubeVideoId } from "./sanitizer";
 import {
@@ -58,6 +59,7 @@ let sharedYtdl: Ytdl | null = null;
 export function getSharedYtdl(): Ytdl {
   if (!sharedYtdl) {
     sharedYtdl = new Ytdl({
+      fetch: safeFetch,
       clients: [
         Client.VisionOS,
         Client.WebEmbedded,
@@ -107,7 +109,7 @@ function defaultFormats(duration: number | null): FormatItem[] {
 
 async function fetchJson<T>(url: string, timeoutMs = 6500, headers?: Record<string, string>): Promise<T | null> {
   try {
-    const res = await fetch(url, {
+    const res = await safeFetch(url, {
       headers: {
         "User-Agent": BROWSER_UA,
         Accept: "application/json, text/plain, */*",
@@ -125,7 +127,7 @@ async function fetchJson<T>(url: string, timeoutMs = 6500, headers?: Record<stri
 
 async function fetchHtml(url: string, timeoutMs = 7000, ua = BROWSER_UA): Promise<string | null> {
   try {
-    const res = await fetch(url, {
+    const res = await safeFetch(url, {
       headers: {
         "User-Agent": ua,
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -549,7 +551,7 @@ async function extractVimeoMetadata(url: string): Promise<ExtractedMetadata> {
 
 async function resolveRedirect(url: string): Promise<string> {
   try {
-    const res = await fetch(url, {
+    const res = await safeFetch(url, {
       method: "HEAD",
       redirect: "follow",
       headers: { "User-Agent": BROWSER_UA },
@@ -602,7 +604,7 @@ async function extractOpenGraphMetadata(url: string, platform: string): Promise<
       url.match(/\/clip\/([\w-]+)/i)?.[1];
     if (clipSlug) {
       try {
-        const res = await fetch("https://gql.twitch.tv/gql", {
+        const res = await safeFetch("https://gql.twitch.tv/gql", {
           method: "POST",
           headers: {
             "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
@@ -887,7 +889,7 @@ export async function resolveDirectStreamUrls(
 
   if (platform === "linkedin") {
     try {
-      const liRes = await fetch("https://saywhat.ai/api/fetch-linkedin-page/", {
+      const liRes = await safeFetch("https://saywhat.ai/api/fetch-linkedin-page/", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

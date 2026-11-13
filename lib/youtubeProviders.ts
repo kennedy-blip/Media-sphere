@@ -12,6 +12,7 @@
  *    etc. + runtime registry discovery, supporting MP4, adaptive mux, and `.m3u8` HLS).
  * 4. Direct YouTube InnerTube (`VISIONOS` 1.02 w/ `visitorData`, `youtubei.js` `ANDROID_VR`/`IOS`).
  */
+import { safeFetch, assertPublicHttpUrl } from "./outboundSecurity";
 import { createDecipheriv } from "crypto";
 import { Innertube, ClientType } from "youtubei.js";
 
@@ -40,10 +41,7 @@ export function normalizeHttpUrl(raw: unknown): string {
   if (typeof raw !== "string" || !raw.trim()) {
     throw new Error("Empty stream URL returned by provider");
   }
-  const parsed = new URL(raw.trim());
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new Error(`Unsupported stream protocol: ${parsed.protocol}`);
-  }
+  const parsed = assertPublicHttpUrl(raw.trim());
   return parsed.toString();
 }
 
@@ -73,7 +71,7 @@ export async function probeMediaStreamUrl(
     reqHeaders.Range = "bytes=0-65535";
   }
 
-  const res = await fetch(normalized, {
+  const res = await safeFetch(normalized, {
     method: "GET",
     headers: reqHeaders,
     redirect: "follow",
@@ -182,7 +180,7 @@ async function discoverSaveTubeCdns(signal?: AbortSignal): Promise<string[]> {
   const found: string[] = [];
   await Promise.allSettled(
     SAVETUBE_RANDOM_ENDPOINTS.map(async (ep) => {
-      const res = await fetch(ep, {
+      const res = await safeFetch(ep, {
         headers: SAVETUBE_API_HEADERS,
         redirect: "follow",
         signal: combineSignal(signal, 6000),
@@ -203,7 +201,7 @@ async function fetchSaveTubeNodeInfo(
   watchUrl: string,
   signal?: AbortSignal
 ): Promise<{ cdn: string; info: SaveTubeMeta }> {
-  const res = await fetch(`https://${cdn}/v2/info`, {
+  const res = await safeFetch(`https://${cdn}/v2/info`, {
     method: "POST",
     headers: SAVETUBE_API_HEADERS,
     body: JSON.stringify({ url: watchUrl }),
@@ -233,7 +231,7 @@ async function requestSaveTubeDownloadLink(
   quality: string,
   signal?: AbortSignal
 ): Promise<string> {
-  const res = await fetch(`https://${cdn}/download`, {
+  const res = await safeFetch(`https://${cdn}/download`, {
     method: "POST",
     headers: SAVETUBE_API_HEADERS,
     body: JSON.stringify({
@@ -345,7 +343,7 @@ export async function resolveViaVidsSave(
     "User-Agent": DESKTOP_UA,
   };
 
-  const res = await fetch("https://api.vidssave.com/api/contentsite_api/media/parse", {
+  const res = await safeFetch("https://api.vidssave.com/api/contentsite_api/media/parse", {
     method: "POST",
     headers,
     body: body.toString(),
@@ -463,11 +461,11 @@ async function getLiveProxyBases(signal?: AbortSignal): Promise<{ piped: string[
   const invidious = new Set<string>();
 
   const [pReg, iReg] = await Promise.allSettled([
-    fetch("https://piped-instances.kavin.rocks/", {
+    safeFetch("https://piped-instances.kavin.rocks/", {
       headers: { "User-Agent": DESKTOP_UA },
       signal: combineSignal(signal, 4500),
     }).then((r) => (r.ok ? r.json() : [])),
-    fetch("https://api.invidious.io/instances.json?sort_by=health", {
+    safeFetch("https://api.invidious.io/instances.json?sort_by=health", {
       headers: { "User-Agent": DESKTOP_UA },
       signal: combineSignal(signal, 4500),
     }).then((r) => (r.ok ? r.json() : [])),
@@ -507,7 +505,7 @@ export async function fetchLivePipedStreams(videoId: string, signal?: AbortSigna
   try {
     return await Promise.any(
       batch.map(async (base) => {
-        const res = await fetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
+        const res = await safeFetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
           headers: { "User-Agent": DESKTOP_UA, Accept: "application/json" },
           signal: combineSignal(signal, 6500),
         });
@@ -537,7 +535,7 @@ export async function resolveViaPipedAndInvidious(
   for (const base of piped.slice(0, 6)) {
     tasks.push(
       (async () => {
-        const res = await fetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
+        const res = await safeFetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
           headers: { "User-Agent": DESKTOP_UA, Accept: "application/json" },
           signal: combineSignal(signal, 8000),
         });
@@ -592,7 +590,7 @@ export async function resolveViaPipedAndInvidious(
   for (const base of invidious.slice(0, 4)) {
     tasks.push(
       (async () => {
-        const res = await fetch(`${base}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+        const res = await safeFetch(`${base}/api/v1/videos/${encodeURIComponent(videoId)}`, {
           headers: { "User-Agent": DESKTOP_UA, Accept: "application/json" },
           signal: combineSignal(signal, 8000),
         });
@@ -632,7 +630,7 @@ async function fetchYoutubeVisitorData(signal?: AbortSignal): Promise<string | u
     return cachedVisitorData.token;
   }
   try {
-    const res = await fetch("https://www.youtube.com/sw.js_data", {
+    const res = await safeFetch("https://www.youtube.com/sw.js_data", {
       headers: { "User-Agent": VISIONOS_UA, Accept: "*/*" },
       signal: combineSignal(signal, 4500),
     });
@@ -666,7 +664,7 @@ export async function resolveViaInnerTubeDirect(
 ): Promise<ResolvedStream> {
   try {
     const visitorData = await fetchYoutubeVisitorData(signal);
-    const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+    const res = await safeFetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -735,7 +733,7 @@ export async function resolveViaInnerTubeDirect(
   }
 
   try {
-    const yt = await Innertube.create({ retrieve_player: false });
+    const yt = await Innertube.create({ retrieve_player: false, fetch: safeFetch });
     for (const client of [ClientType.ANDROID_VR, ClientType.IOS]) {
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any

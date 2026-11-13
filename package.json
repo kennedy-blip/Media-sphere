@@ -8,16 +8,19 @@
     "start": "next start --hostname 0.0.0.0 --port 3000",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "typecheck": "tsc --noEmit --incremental false"
+    "typecheck": "tsc --noEmit --incremental false",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@distube/ytdl-core": "^5.2.1",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "ipaddr.js": "^2.5.0",
     "lucide-react": "^0.469.0",
     "next": "^15.5.29",
     "react": "^19.2.9",
     "react-dom": "^19.2.9",
     "socket.io-client": "^4.8.1",
+    "undici": "^8.12.4",
     "youtube-caption-extractor": "^1.10.3",
     "youtubei.js": "^18.3.0",
     "zustand": "^5.0.2"
@@ -32,6 +35,7 @@
     "eslint-config-next": "^15.5.29",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.2"
   }
 }
