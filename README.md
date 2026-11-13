@@ -4,6 +4,8 @@ All-in-one, high-performance web platform that extracts, processes, transcribes,
 
 Strict URL sandboxing · client-side tracking removal · background job queues · real-time WebSocket progress · server-side FFmpeg · AI transcript generation.
 
+See [`ROADMAP.md`](ROADMAP.md) for the audited architecture, verified limitations, prioritized backlog, and GitHub Project handover instructions. Advertised capabilities are not all production-verified.
+
 ## Architecture
 
 ```
