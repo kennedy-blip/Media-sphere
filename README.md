@@ -72,8 +72,8 @@ Importing this repository into Vercel works out of the box:
 # Backend unit + API lifecycle tests
 .venv/bin/python -m unittest discover -s backend/tests -v
 
-# Frontend lint, TypeScript & production build check
-npm run lint && npm run typecheck && npm run build
+# Frontend security tests, lint, TypeScript & production build check
+npm test && npm run lint && npm run typecheck && npm run build
 
 # Shell script checks
 bash -n setup_project_board.sh && shellcheck setup_project_board.sh
@@ -105,3 +105,24 @@ Use `npm run lint:fix` to apply autofixable lint changes locally.
 - Enforces `https://` only
 - Strict whitelist regex across canonical, mobile (`m.`, `mobile.`, `old.`), and short-link (`youtu.be`, `vm.tiktok.com`, `vt.tiktok.com`, `pin.it`, `redd.it`, `fb.watch`) domains
 - Blocks IPv4 & IPv6 SSRF ranges: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`, `fc00::/7`, `fe80::/10`, cloud metadata IPs
+
+
+### Outbound network safety and compatibility
+
+Provider, relay, subtitle and media requests use guarded HTTP transports. They
+reject credentials, non-HTTP(S) schemes and non-public addresses, validate every
+DNS answer at connection time, pin the connection to a validated answer, and
+recheck redirects. The Next.js image optimizer does not accept remote images.
+The configured API reverse proxy and administrator-configured Whisper model are
+trusted infrastructure and are outside this outbound-media guard. Network-level
+egress restrictions remain recommended as defense in depth.
+
+FFmpeg is restricted to staged local media and an input format/protocol
+allowlist. The Node pipeline stages unencrypted, finite MPEG-TS HLS playlists,
+including nested variants, through the guarded transport; encrypted, live,
+byte-range, fMP4 and separate-rendition HLS playlists fail closed. The backend
+uses one direct HTTP media stream (no adaptive multi-stream merging or HLS), so
+some resolutions or providers may not be available. yt-dlp proxies (including
+`YTDLP_PROXY` and `HTTPS_PROXY`) are disabled because remote proxy resolution
+cannot be pinned, and the yt-dlp dependency is pinned because the guard uses its
+networking integration. Review and test that integration before upgrading it.

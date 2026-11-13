@@ -2,6 +2,8 @@
  * Real server-side media stream download + FFmpeg trim/mux/conversion pipeline.
  * Runs in Node.js (Next.js App Router & Vercel Fluid Compute Serverless Functions).
  */
+import { safeFetch } from "./outboundSecurity";
+import { stageHlsMedia } from "./hlsStaging";
 import { execFile } from "child_process";
 import fs from "fs";
 import path from "path";
@@ -96,6 +98,7 @@ async function streamReadableToFile(
   fs.closeSync(fd);
   const sample = head.subarray(0, readBytes).toString("latin1").trimStart().toLowerCase();
   if (
+    sample.startsWith("#extm3u") ||
     sample.startsWith("<!doctype") ||
     sample.startsWith("<html") ||
     sample.startsWith('{"error') ||
@@ -113,7 +116,7 @@ async function downloadHttpUrlToFile(
   onProgress?: (p: ProgressCallbackPayload) => void,
   progressRange: [number, number] = [28, 74]
 ): Promise<void> {
-  const res = await fetch(streamUrl, {
+  const res = await safeFetch(streamUrl, {
     headers: {
       "User-Agent": BROWSER_UA,
       Accept: "*/*",
@@ -206,32 +209,24 @@ async function downloadYoutubeYtdlFallback(
   return { videoInput: vidDest, audioInput: audDest };
 }
 
-function formatFfmpegHeaderArg(headers?: Record<string, string>): string | null {
-  if (!headers || Object.keys(headers).length === 0) return null;
-  const lines = Object.entries(headers)
-    .filter(([k, v]) => k && v)
-    .map(([k, v]) => `${k}: ${v}\r\n`);
-  return lines.length > 0 ? lines.join("") : null;
-}
-
 async function runFfmpegProcess(params: {
   videoInput?: string;
   audioInput?: string;
-  inputHeaders?: Record<string, string>;
   outputPath: string;
   format: string;
   trimStart: string | null;
   trimEnd: string | null;
 }): Promise<void> {
   const ffmpeg = resolveFfmpegBin();
-  const headerBlock = formatFfmpegHeaderArg(params.inputHeaders);
 
   const buildInputArgs = (input: string) => {
     const out: string[] = [];
-    const isRemote = /^https?:\/\//i.test(input);
-    if (isRemote && headerBlock) {
-      out.push("-headers", headerBlock);
+    // Never let FFmpeg fetch URLs or interpret a local playlist/container that
+    // can reference arbitrary paths or protocols. HLS is staged separately.
+    if (!path.isAbsolute(input) || path.dirname(input) !== MEDIA_TMP_DIR) {
+      throw new Error("FFmpeg input must be a staged local media file");
     }
+    out.push("-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,mp3,wav,ogg,flac,mpegts,aac,mpeg,avi,m4v");
     if (params.trimStart) out.push("-ss", params.trimStart);
     if (params.trimEnd) out.push("-to", params.trimEnd);
     out.push("-i", input);
@@ -334,7 +329,6 @@ export async function downloadAndProcessRealMedia(params: {
 
   let videoInput: string | undefined;
   let audioInput: string | undefined;
-  let inputHeaders: Record<string, string> | undefined;
 
   const stageStreamToInputs = async (direct: {
     videoUrl?: string;
@@ -342,21 +336,23 @@ export async function downloadAndProcessRealMedia(params: {
     headers?: Record<string, string>;
     isHls?: boolean;
   }, wantAudioOnly: boolean) => {
-    inputHeaders = direct.headers;
     const primaryStream = wantAudioOnly ? (direct.audioUrl || direct.videoUrl) : direct.videoUrl;
     if (!primaryStream) {
       throw new Error("Provider returned empty media URL");
     }
 
     if (direct.isHls || isHlsManifestUrl(primaryStream)) {
-      params.onProgress?.({ progress: 52, speedMbps: 2.4, etaSeconds: 5 });
-      if (wantAudioOnly) {
-        audioInput = primaryStream;
-      } else {
-        videoInput = primaryStream;
-        if (direct.audioUrl && direct.audioUrl !== primaryStream) {
-          audioInput = direct.audioUrl;
-        }
+      const primaryTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_${wantAudioOnly ? "aud" : "vid"}.media`);
+      safeUnlink(primaryTmp);
+      await stageHlsMedia(primaryStream, primaryTmp, direct.headers);
+      if (wantAudioOnly) audioInput = primaryTmp;
+      else videoInput = primaryTmp;
+      if (!wantAudioOnly && direct.audioUrl && direct.audioUrl !== primaryStream) {
+        const audioTmp = path.join(MEDIA_TMP_DIR, `${params.fileKey}_aud.media`);
+        safeUnlink(audioTmp);
+        if (isHlsManifestUrl(direct.audioUrl)) await stageHlsMedia(direct.audioUrl, audioTmp, direct.headers);
+        else await downloadHttpUrlToFile(direct.audioUrl, audioTmp, direct.headers);
+        audioInput = audioTmp;
       }
       return;
     }
@@ -403,7 +399,6 @@ export async function downloadAndProcessRealMedia(params: {
         try {
           videoInput = undefined;
           audioInput = undefined;
-          inputHeaders = undefined;
           const resolved: ResolvedStream = await cand.resolve();
           await stageStreamToInputs(resolved, wantAudioOnly);
           downloaded = true;
@@ -450,7 +445,6 @@ export async function downloadAndProcessRealMedia(params: {
     await runFfmpegProcess({
       videoInput,
       audioInput,
-      inputHeaders,
       outputPath,
       format: ext,
       trimStart: params.trimStart,

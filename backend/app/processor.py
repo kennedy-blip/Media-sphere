@@ -21,6 +21,8 @@ except Exception:
 STORAGE_DIR = os.environ.get("MEDIA_STORAGE_DIR", "/tmp/mediasphere_storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
+FFMPEG_INPUT_GUARD = ["-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,mp3,wav,ogg,flac,mpegts,aac,mpeg,avi,m4v"]
+
 MIME_TYPES = {
     "mp4": "video/mp4",
     "webm": "video/webm",
@@ -74,7 +76,7 @@ def trim_media(input_path: str, output_path: str, start: str | None, end: str | 
         cmd += ["-ss", start]
     if end:
         cmd += ["-to", end]
-    cmd += ["-i", input_path]
+    cmd += [*FFMPEG_INPUT_GUARD, "-i", input_path]
     if use_stream_copy:
         cmd += ["-c", "copy"]
     else:
@@ -96,7 +98,7 @@ def convert_media(input_path: str, output_path: str, fmt: str) -> bool:
         return False
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         return True
-    cmd = [ffmpeg, "-y", "-i", input_path]
+    cmd = [ffmpeg, "-y", *FFMPEG_INPUT_GUARD, "-i", input_path]
     if fmt == "mp3":
         cmd += ["-vn", "-codec:a", "libmp3lame", "-q:a", "2"]
     elif fmt == "wav":
@@ -115,7 +117,7 @@ def convert_media(input_path: str, output_path: str, fmt: str) -> bool:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         if fmt == "mp4" and input_path.lower().endswith(".mp4"):
             # Fallback transcode if stream copy failed
-            cmd2 = [ffmpeg, "-y", "-i", input_path, "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-movflags", "+faststart", output_path]
+            cmd2 = [ffmpeg, "-y", *FFMPEG_INPUT_GUARD, "-i", input_path, "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-movflags", "+faststart", output_path]
             try:
                 subprocess.run(cmd2, capture_output=True, timeout=600, check=True)
                 return os.path.exists(output_path) and os.path.getsize(output_path) > 256

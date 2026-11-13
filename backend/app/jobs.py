@@ -258,8 +258,13 @@ def run_job(job_id: str) -> dict | None:
                 else:
                     processed_ok = convert_media(raw_path, final_path, fmt)
             else:
-                os.replace(raw_path, final_path)
-                processed_ok = True
+                # Never pass unverified upstream bytes directly to Whisper/AV;
+                # they may be playlists that reference network or local files.
+                try:
+                    os.remove(raw_path)
+                except OSError:
+                    pass
+                raise RuntimeError("FFmpeg is required to safely process downloaded media")
 
             try:
                 if os.path.exists(raw_path) and os.path.abspath(raw_path) != os.path.abspath(final_path):

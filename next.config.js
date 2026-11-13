@@ -12,11 +12,6 @@ const nextConfig = {
     "/api/v1/jobs/[id]": ["./node_modules/@ffmpeg-installer/**/*"],
     "/api/v1/jobs/[id]/download": ["./node_modules/@ffmpeg-installer/**/*"],
   },
-  images: {
-    remotePatterns: [
-      { protocol: "https", hostname: "**" },
-    ],
-  },
   async rewrites() {
     const backendUrl = (
       process.env.API_PROXY_TARGET ||

@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import urllib.request
 import json
 from typing import Any
 
 from .processor import get_ffmpeg_bin
+from .outbound_security import GuardedYoutubeDL
 
 try:
     import yt_dlp  # type: ignore
@@ -83,15 +83,12 @@ def extract_metadata(url: str, platform: str) -> dict[str, Any]:
         "js_runtimes": {"node": {}},
         "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv", "mweb"]}},
     }
-    proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTPS_PROXY")
-    if proxy:
-        ydl_opts["proxy"] = proxy
     ffmpeg_bin = get_ffmpeg_bin()
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with GuardedYoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise RuntimeError("No media info returned from source URL")
@@ -147,7 +144,7 @@ def extract_platform_subtitles(url: str) -> list[dict[str, Any]]:
         "socket_timeout": 10,
     }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with GuardedYoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 return []
@@ -170,8 +167,8 @@ def extract_platform_subtitles(url: str) -> list[dict[str, Any]]:
             target = json3_track or next((t for t in tracks if t.get("url")), None)
             if not target:
                 return []
-            req = urllib.request.Request(target["url"], headers={"User-Agent": "Mozilla/5.0"})
-            raw = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", errors="ignore")
+            with ydl.urlopen(target["url"]) as response:
+                raw = response.read(2 * 1024 * 1024).decode("utf-8", errors="ignore")
             if target.get("ext") == "json3" or raw.lstrip().startswith("{"):
                 parsed = json.loads(raw)
                 cues = []
@@ -222,21 +219,19 @@ def download_stream(
         "noplaylist": True,
         "format": get_format_string(resolution, fmt),
         "outtmpl": outtmpl,
-        "merge_output_format": "mp4" if fmt == "mp4" and resolution != "audio" else None,
+        "proxy": "",
+        "fixup": "never",
         "socket_timeout": 15,
         "retries": 3,
         "progress_hooks": [_hook],
         "js_runtimes": {"node": {}},
         "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv", "mweb"]}},
     }
-    proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTPS_PROXY")
-    if proxy:
-        ydl_opts["proxy"] = proxy
     ffmpeg_bin = get_ffmpeg_bin()
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
 
-    with yt_dlp.YoutubeDL({k: v for k, v in ydl_opts.items() if v is not None}) as ydl:
+    with GuardedYoutubeDL({k: v for k, v in ydl_opts.items() if v is not None}) as ydl:
         info = ydl.extract_info(url, download=True)
         if info:
             prepared = ydl.prepare_filename(info)
@@ -249,14 +244,9 @@ def download_stream(
 
 
 def get_format_string(resolution: str, fmt: str) -> str:
+    # Only a single direct HTTP stream can be downloaded without delegating
+    # network access to FFmpeg or other external downloaders.
     if resolution == "audio" or fmt in ("mp3", "wav"):
-        return "bestaudio/best"
-    res_map = {
-        "2160p": "bv*[height<=2160]+ba/b[height<=2160]/b",
-        "1080p": "bv*[height<=1080]+ba/b[height<=1080]/b",
-        "720p": "bv*[height<=720]+ba/b[height<=720]/b",
-        "480p": "bv*[height<=480]+ba/b[height<=480]/b",
-        "360p": "bv*[height<=360]+ba/b[height<=360]/b",
-        "best": "bv*+ba/b",
-    }
-    return res_map.get(resolution, "bv*[height<=1080]+ba/b[height<=1080]/b")
+        return "bestaudio[protocol^=http]/best[protocol^=http]"
+    height = {"2160p": 2160, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360}.get(resolution, 2160)
+    return f"best[height<={height}][protocol^=http]/best[protocol^=http]"

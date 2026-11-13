@@ -3,6 +3,7 @@
  * Pulls authentic timed captions from YouTube/Piped/Invidious/VTT tracks + LRCLIB synced lyrics
  * for music videos, applies optional [trim_start, trim_end] windowing, and computes a summary.
  */
+import { safeFetch } from "./outboundSecurity";
 import { CaptionFormat } from "@distube/ytdl-core";
 import { getSubtitles } from "youtube-caption-extractor";
 import { parseTimestampSeconds } from "./api";
@@ -132,7 +133,7 @@ async function fetchSyncedLyricsFallback(meta: ExtractedMetadata): Promise<{ cue
   if (!cleanTitle || cleanTitle.length < 3) return { cues: [], plain: null };
 
   try {
-    const res = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(cleanTitle)}`, {
+    const res = await safeFetch(`https://lrclib.net/api/search?q=${encodeURIComponent(cleanTitle)}`, {
       headers: { "User-Agent": "MediaSphere/2.0 (https://media-sphere-ten.vercel.app)" },
       signal: AbortSignal.timeout(5000),
     });
@@ -232,7 +233,7 @@ async function fetchYoutubeCues(videoId: string): Promise<Cue[]> {
       piped?.subtitles?.find((s) => s.code?.startsWith("en")) ||
       piped?.subtitles?.[0];
     if (subTrack?.url) {
-      const res = await fetch(subTrack.url, { signal: AbortSignal.timeout(5000) });
+      const res = await safeFetch(subTrack.url, { signal: AbortSignal.timeout(5000) });
       if (res.ok) {
         const cues = parseVttToCues(await res.text());
         if (cues.length > 0) return cues;
@@ -245,7 +246,7 @@ async function fetchYoutubeCues(videoId: string): Promise<Cue[]> {
   // 2. youtube-caption-extractor
   try {
     const subs = await Promise.race([
-      getSubtitles({ videoID: videoId, lang: "en" }),
+      getSubtitles({ videoID: videoId, lang: "en", fetch: safeFetch }),
       new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
     ]);
     if (subs && subs.length > 0) {
@@ -280,7 +281,7 @@ async function fetchYoutubeCues(videoId: string): Promise<Cue[]> {
     const cap = inv?.data.captions?.[0];
     if (inv && cap?.url) {
       const capUrl = cap.url.startsWith("http") ? cap.url : `${inv.base}${cap.url}`;
-      const res = await fetch(capUrl, { signal: AbortSignal.timeout(4500) });
+      const res = await safeFetch(capUrl, { signal: AbortSignal.timeout(4500) });
       if (res.ok) {
         const cues = parseVttToCues(await res.text());
         if (cues.length > 0) return cues;
